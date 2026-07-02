@@ -1,4 +1,6 @@
-package etcd
+// Package etcdclient manages reusable, named etcd clients independently from
+// higher-level consumers such as service registries.
+package etcdclient
 
 import (
 	"errors"
@@ -13,9 +15,10 @@ var namedClients = struct {
 }{clients: make(map[string]*clientv3.Client)}
 
 // GetOrCreateClient returns the named client, creating it from config on first use.
+// Later calls with the same name reuse the first client and ignore their config.
 func GetOrCreateClient(name string, config clientv3.Config) (*clientv3.Client, error) {
 	if name == "" {
-		return nil, errors.New("registry/etcd: client name is empty")
+		return nil, errors.New("etcdclient: client name is empty")
 	}
 	namedClients.Lock()
 	defer namedClients.Unlock()

@@ -15,9 +15,9 @@ func send(ctx context.Context, resolver registry.Resolver, request *http.Request
 	if err != nil {
 		return nil, err
 	}
-	instance := resolution.Instance()
 	request.URL.Scheme = "http"
-	request.URL.Host = instance.Endpoint[len("http://"):]
+	endpoint := resolution.Endpoint()
+	request.URL.Host = endpoint[len("http://"):]
 
 	protocols := new(http.Protocols)
 	protocols.SetUnencryptedHTTP2(true)

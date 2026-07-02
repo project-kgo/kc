@@ -1,200 +1,456 @@
 package etcd
 
 import (
-	"errors"
-	"sort"
+	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/project-kgo/kc/pkg/registry"
 )
 
+// instanceState stores one immutable descriptor and atomically updated health data.
 type instanceState struct {
-	instance     registry.Instance
-	ewma         time.Duration
-	inflight     int64
-	failures     int
-	ejectedUntil time.Time
-	halfOpen     bool
+	instance     atomic.Pointer[registry.Instance]
+	index        int
+	ewma         atomic.Int64
+	inflight     atomic.Int64
+	failures     atomic.Int32
+	ejectedUntil atomic.Int64
+	halfOpen     atomic.Bool
 }
 
+// newInstanceState initializes health data for a newly discovered endpoint.
+func newInstanceState(instance registry.Instance, initialLatency time.Duration) *instanceState {
+	item := &instanceState{}
+	item.storeInstance(instance)
+	item.ewma.Store(int64(initialLatency))
+	return item
+}
+
+// storeInstance atomically replaces the descriptor with a defensive copy.
+func (s *instanceState) storeInstance(instance registry.Instance) {
+	clone := instance.Clone()
+	s.instance.Store(&clone)
+}
+
+// loadInstance returns the current immutable descriptor without cloning metadata.
+func (s *instanceState) loadInstance() registry.Instance {
+	return *s.instance.Load()
+}
+
+// serviceState owns one service's topology, health data, and pending reports.
 type serviceState struct {
 	name        string
-	mu          sync.Mutex
+	mu          sync.RWMutex // protects topology, load, and refresh state
 	instances   map[string]*instanceState
+	items       []*instanceState
+	revision    int64
 	ready       chan struct{}
 	readyOnce   sync.Once
 	loadErr     error
 	refreshing  bool
 	refreshDone chan struct{}
+	refreshErr  error
+	lastRefresh time.Time
+	lastUsed    atomic.Int64
+	active      atomic.Int64
+	rng         atomic.Uint64
+	pendingMu   sync.Mutex
+	pending     *resolution
+	pendingTail *resolution
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
+// newServiceState creates an empty service cache with a per-service random seed.
 func newServiceState(name string) *serviceState {
-	return &serviceState{name: name, instances: make(map[string]*instanceState), ready: make(chan struct{})}
+	seed := uint64(time.Now().UnixNano()) ^ uint64(len(name))*0x9e3779b97f4a7c15
+	if seed == 0 {
+		seed = 1
+	}
+	state := &serviceState{name: name, instances: make(map[string]*instanceState), ready: make(chan struct{})}
+	state.lastUsed.Store(time.Now().UnixNano())
+	state.rng.Store(seed)
+	return state
 }
 
+// replace unconditionally replaces topology; it is used by isolated unit paths.
 func (s *serviceState) replace(instances []registry.Instance, initialLatency time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	next := make(map[string]*instanceState, len(instances))
-	for _, instance := range instances {
-		if previous := s.instances[instance.ID]; previous != nil && previous.instance.Endpoint == instance.Endpoint {
-			previous.instance = instance.Clone()
-			next[instance.ID] = previous
-		} else {
-			next[instance.ID] = &instanceState{instance: instance.Clone(), ewma: initialLatency}
-		}
-	}
-	s.instances = next
+	s.replaceLocked(instances, initialLatency)
 }
 
-func (s *serviceState) allEjected(now time.Time) bool {
+// replaceAt applies a full snapshot only when its etcd revision is not stale.
+func (s *serviceState) replaceAt(instances []registry.Instance, initialLatency time.Duration, revision int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.instances) == 0 {
+	if revision < s.revision {
+		return
+	}
+	s.replaceLocked(instances, initialLatency)
+	s.revision = revision
+}
+
+// replaceLocked rebuilds the indexed topology while preserving compatible health state.
+func (s *serviceState) replaceLocked(instances []registry.Instance, initialLatency time.Duration) {
+	nextMap := make(map[string]*instanceState, len(instances))
+	nextItems := make([]*instanceState, 0, len(instances))
+	for _, instance := range instances {
+		item := s.instances[instance.ID]
+		if item == nil || item.loadInstance().Endpoint != instance.Endpoint {
+			item = newInstanceState(instance, initialLatency)
+		} else {
+			item.storeInstance(instance)
+		}
+		item.index = len(nextItems)
+		nextMap[instance.ID] = item
+		nextItems = append(nextItems, item)
+	}
+	s.instances, s.items = nextMap, nextItems
+}
+
+// put unconditionally inserts or updates one instance.
+func (s *serviceState) put(instance registry.Instance, initialLatency time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.putLocked(instance, initialLatency)
+}
+
+// putAt applies a watch PUT only when its revision is current.
+func (s *serviceState) putAt(instance registry.Instance, initialLatency time.Duration, revision int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if revision < s.revision {
+		return
+	}
+	s.putLocked(instance, initialLatency)
+	s.revision = revision
+}
+
+// putLocked updates the map and dense P2C candidate slice under the topology lock.
+func (s *serviceState) putLocked(instance registry.Instance, initialLatency time.Duration) {
+	if previous := s.instances[instance.ID]; previous != nil {
+		item := previous
+		if previous.loadInstance().Endpoint != instance.Endpoint {
+			item = newInstanceState(instance, initialLatency)
+		} else {
+			item.storeInstance(instance)
+		}
+		item.index = previous.index
+		s.instances[instance.ID] = item
+		s.items[item.index] = item
+		return
+	}
+	item := newInstanceState(instance, initialLatency)
+	item.index = len(s.items)
+	s.instances[instance.ID] = item
+	s.items = append(s.items, item)
+}
+
+// remove unconditionally removes an instance by ID.
+func (s *serviceState) remove(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.removeLocked(id)
+}
+
+// removeAt applies a watch DELETE only when its revision is current.
+func (s *serviceState) removeAt(id string, revision int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if revision < s.revision {
+		return
+	}
+	s.removeLocked(id)
+	s.revision = revision
+}
+
+// removeLocked removes an instance in O(1) by swapping the dense-slice tail.
+func (s *serviceState) removeLocked(id string) {
+	item := s.instances[id]
+	if item == nil {
+		return
+	}
+	last := len(s.items) - 1
+	if item.index != last {
+		s.items[item.index] = s.items[last]
+		s.items[item.index].index = item.index
+	}
+	s.items[last] = nil
+	s.items = s.items[:last]
+	delete(s.instances, id)
+}
+
+// advanceRevision records skipped or empty watch responses as consistency barriers.
+func (s *serviceState) advanceRevision(revision int64) {
+	s.mu.Lock()
+	if revision > s.revision {
+		s.revision = revision
+	}
+	s.mu.Unlock()
+}
+
+// allEjected reports whether no normal or half-open candidate is currently usable.
+func (s *serviceState) allEjected(now time.Time) bool {
+	nowNanos := now.UnixNano()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.items) == 0 {
 		return false
 	}
-	for _, item := range s.instances {
-		if item.ejectedUntil.IsZero() || (!now.Before(item.ejectedUntil) && !item.halfOpen) {
+	for _, item := range s.items {
+		until := item.ejectedUntil.Load()
+		if until == 0 || (nowNanos >= until && !item.halfOpen.Load()) {
 			return false
 		}
 	}
 	return true
 }
 
+// canEvict checks inactivity, active Resolve calls, and pending result reports.
+func (s *serviceState) canEvict(now time.Time, idleTTL time.Duration) bool {
+	if s.active.Load() != 0 || now.Sub(time.Unix(0, s.lastUsed.Load())) < idleTTL {
+		return false
+	}
+	s.pendingMu.Lock()
+	empty := s.pending == nil
+	s.pendingMu.Unlock()
+	return empty
+}
+
+// randomN returns a lock-free per-service pseudo-random index.
+func (s *serviceState) randomN(n int) int {
+	x := s.rng.Add(0x9e3779b97f4a7c15)
+	x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9
+	x = (x ^ (x >> 27)) * 0x94d049bb133111eb
+	x ^= x >> 31
+	return int(x % uint64(n))
+}
+
+// pick is allocation-free and concurrent across callers. randN is only used
+// by deterministic unit tests; production passes nil.
 func (s *serviceState) pick(now time.Time, randN func(int) int, _ int, _ time.Duration) (*instanceState, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.instances) == 0 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	count := len(s.items)
+	if count == 0 {
 		return nil, false
 	}
-	items := make([]*instanceState, 0, len(s.instances))
-	all := make([]*instanceState, 0, len(s.instances))
-	for _, item := range s.instances {
-		all = append(all, item)
-		if item.ejectedUntil.IsZero() || (!now.Before(item.ejectedUntil) && !item.halfOpen) {
-			items = append(items, item)
+	nowNanos := now.UnixNano()
+	random := s.randomN
+	if randN != nil {
+		random = randN
+	}
+	eligible := func(item *instanceState) bool {
+		until := item.ejectedUntil.Load()
+		return until == 0 || (nowNanos >= until && !item.halfOpen.Load())
+	}
+
+	var first, second *instanceState
+	for attempts := 0; attempts < 8 && (first == nil || (second == nil && count > 1)); attempts++ {
+		item := s.items[random(count)]
+		if !eligible(item) {
+			continue
+		}
+		if first == nil {
+			first = item
+		} else if item != first {
+			second = item
 		}
 	}
-	allEjected := len(items) == 0
-	if allEjected {
-		failOpen := all[:0]
-		for _, item := range all {
-			if !item.halfOpen {
-				failOpen = append(failOpen, item)
+	if first == nil || (second == nil && count > 1) {
+		for _, item := range s.items {
+			if !eligible(item) {
+				continue
+			}
+			if first == nil {
+				first = item
+			} else if item != first {
+				second = item
+				break
 			}
 		}
-		if len(failOpen) == 0 {
+	}
+	allEjected := first == nil
+	if allEjected {
+		for _, item := range s.items {
+			if item.halfOpen.Load() {
+				continue
+			}
+			if first == nil || item.ejectedUntil.Load() < first.ejectedUntil.Load() {
+				first = item
+			}
+		}
+		if first == nil {
 			return nil, true
 		}
-		sort.Slice(failOpen, func(i, j int) bool { return failOpen[i].ejectedUntil.Before(failOpen[j].ejectedUntil) })
-		items = failOpen[:1]
 	}
-	chosen := items[0]
-	if len(items) > 1 {
-		first := randN(len(items))
-		second := randN(len(items) - 1)
-		if second >= first {
-			second++
+	chosen := first
+	if second != nil && score(second) < score(first) {
+		chosen = second
+	}
+	until := chosen.ejectedUntil.Load()
+	if until != 0 && nowNanos >= until && !chosen.halfOpen.CompareAndSwap(false, true) {
+		if second == nil || !reserve(second, nowNanos) {
+			return nil, allEjected
 		}
-		a, b := items[first], items[second]
-		if score(b) < score(a) {
-			chosen = b
-		} else {
-			chosen = a
-		}
+		chosen = second
+	} else {
+		chosen.inflight.Add(1)
 	}
-	if !chosen.ejectedUntil.IsZero() && !now.Before(chosen.ejectedUntil) {
-		chosen.halfOpen = true
-	}
-	chosen.inflight++
+	s.lastUsed.Store(nowNanos)
 	return chosen, allEjected
 }
 
+// reserve atomically claims a candidate and increments its in-flight request count.
+func reserve(item *instanceState, nowNanos int64) bool {
+	until := item.ejectedUntil.Load()
+	if until != 0 && nowNanos >= until && !item.halfOpen.CompareAndSwap(false, true) {
+		return false
+	}
+	item.inflight.Add(1)
+	return true
+}
+
+// score computes the P2C load score from latency EWMA and current concurrency.
 func score(item *instanceState) float64 {
-	return float64(item.ewma) * float64(item.inflight+1)
+	return float64(item.ewma.Load()) * float64(item.inflight.Load()+1)
 }
 
+// resolution binds one selected instance to a single result report.
 type resolution struct {
-	state    *serviceState
-	selected *instanceState
-	instance registry.Instance
-	options  Options
-	mu       sync.Mutex
-	status   uint8
-	timer    *time.Timer
+	state            *serviceState
+	selected         *instanceState
+	instance         registry.Instance
+	ejectionDuration time.Duration
+	failureThreshold int32
+	alpha            float64
+	deadline         time.Time
+	status           atomic.Uint32
+	prev, next       *resolution
 }
 
+// newResolution appends a report deadline to the service's ordered pending queue.
 func newResolution(state *serviceState, selected *instanceState, options Options) *resolution {
-	r := &resolution{state: state, selected: selected, instance: selected.instance.Clone(), options: options}
-	r.timer = time.AfterFunc(options.ReportTimeout, r.expire)
+	r := &resolution{
+		state: state, selected: selected, instance: selected.loadInstance(),
+		ejectionDuration: options.EjectionDuration, failureThreshold: int32(options.FailureThreshold),
+		alpha: options.EWMAAlpha, deadline: time.Now().Add(options.ReportTimeout),
+	}
+	state.pendingMu.Lock()
+	r.prev = state.pendingTail
+	if state.pendingTail != nil {
+		state.pendingTail.next = r
+	} else {
+		state.pending = r
+	}
+	state.pendingTail = r
+	state.pendingMu.Unlock()
 	return r
 }
 
+// Instance returns a defensive copy of the selected instance.
 func (r *resolution) Instance() registry.Instance { return r.instance.Clone() }
 
+// Endpoint returns the selected h2c endpoint without cloning metadata.
+func (r *resolution) Endpoint() string { return r.instance.Endpoint }
+
+// Report applies latency and health feedback exactly once.
 func (r *resolution) Report(result registry.Result) error {
 	if err := result.Validate(); err != nil {
 		return err
 	}
-	r.mu.Lock()
-	if r.status == 1 {
-		r.mu.Unlock()
+	if !r.status.CompareAndSwap(0, 1) {
+		if r.status.Load() == 2 {
+			return registry.ErrReportExpired
+		}
 		return registry.ErrAlreadyReported
 	}
-	if r.status == 2 {
-		r.mu.Unlock()
-		return registry.ErrReportExpired
-	}
-	r.status = 1
-	r.timer.Stop()
-	r.complete(&result)
-	r.mu.Unlock()
+	r.state.pendingMu.Lock()
+	r.unlinkLocked()
+	r.state.pendingMu.Unlock()
+	r.complete(&result, time.Now())
 	return nil
 }
 
-func (r *resolution) expire() {
-	r.mu.Lock()
-	if r.status != 0 {
-		r.mu.Unlock()
-		return
+// expire removes ordered pending reports whose deadlines have elapsed.
+func (s *serviceState) expire(now time.Time) int {
+	expired := 0
+	s.pendingMu.Lock()
+	for current := s.pending; current != nil && !now.Before(current.deadline); current = s.pending {
+		if current.status.CompareAndSwap(0, 2) {
+			current.unlinkLocked()
+			current.complete(nil, now)
+			expired++
+		} else {
+			current.unlinkLocked()
+		}
 	}
-	r.status = 2
-	r.complete(nil)
-	r.mu.Unlock()
+	s.pendingMu.Unlock()
+	return expired
 }
 
-func (r *resolution) complete(result *registry.Result) {
-	r.state.mu.Lock()
-	defer r.state.mu.Unlock()
+// complete updates in-flight, EWMA, failure, ejection, and half-open state.
+func (r *resolution) complete(result *registry.Result, now time.Time) {
 	selected := r.selected
-	if selected.inflight > 0 {
-		selected.inflight--
+	for {
+		current := selected.inflight.Load()
+		if current <= 0 || selected.inflight.CompareAndSwap(current, current-1) {
+			break
+		}
 	}
+	r.state.mu.RLock()
 	current := r.state.instances[r.instance.ID]
-	if current != selected || current.instance.Endpoint != r.instance.Endpoint {
+	valid := current == selected && current.loadInstance().Endpoint == r.instance.Endpoint
+	r.state.mu.RUnlock()
+	if !valid {
 		return
 	}
 	if result == nil {
-		if selected.halfOpen {
-			selected.halfOpen = false
-			selected.ejectedUntil = time.Now().Add(r.options.EjectionDuration)
+		if selected.halfOpen.CompareAndSwap(true, false) {
+			selected.ejectedUntil.Store(now.Add(r.ejectionDuration).UnixNano())
 		}
 		return
 	}
-	selected.ewma = time.Duration((1-r.options.EWMAAlpha)*float64(selected.ewma) + r.options.EWMAAlpha*float64(result.Latency))
+	updateEWMA(selected, result.Latency, r.alpha)
 	if result.Outcome == registry.OutcomeSuccess {
-		selected.failures = 0
-		selected.ejectedUntil = time.Time{}
-		selected.halfOpen = false
+		selected.failures.Store(0)
+		selected.ejectedUntil.Store(0)
+		selected.halfOpen.Store(false)
 		return
 	}
-	selected.failures++
-	if selected.halfOpen || selected.failures >= r.options.FailureThreshold {
-		selected.failures = 0
-		selected.halfOpen = false
-		selected.ejectedUntil = time.Now().Add(r.options.EjectionDuration)
+	failures := selected.failures.Add(1)
+	if selected.halfOpen.Load() || failures >= r.failureThreshold {
+		selected.failures.Store(0)
+		selected.halfOpen.Store(false)
+		selected.ejectedUntil.Store(now.Add(r.ejectionDuration).UnixNano())
 	}
 }
 
-var errNoInstances = errors.New("no instances")
+// updateEWMA atomically incorporates a latency sample.
+func updateEWMA(item *instanceState, latency time.Duration, alpha float64) {
+	for {
+		old := item.ewma.Load()
+		next := int64((1-alpha)*float64(old) + alpha*float64(latency))
+		if item.ewma.CompareAndSwap(old, next) {
+			return
+		}
+	}
+}
+
+// unlinkLocked removes the resolution from the pending list in O(1).
+func (r *resolution) unlinkLocked() {
+	if r.prev != nil {
+		r.prev.next = r.next
+	} else if r.state.pending == r {
+		r.state.pending = r.next
+	}
+	if r.next != nil {
+		r.next.prev = r.prev
+	} else if r.state.pendingTail == r {
+		r.state.pendingTail = r.prev
+	}
+	r.prev, r.next = nil, nil
+}

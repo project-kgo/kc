@@ -51,6 +51,7 @@ func (i Instance) Validate() error {
 	return nil
 }
 
+// invalidSegment rejects empty values and names that could escape an etcd key segment.
 func invalidSegment(value string) bool {
 	value = strings.TrimSpace(value)
 	return value == "" || value == "." || value == ".." || strings.ContainsAny(value, `/\\`)
@@ -84,6 +85,7 @@ type Result struct {
 	Latency time.Duration
 }
 
+// Validate checks that the result contains a supported outcome and positive latency.
 func (r Result) Validate() error {
 	if (r.Outcome != OutcomeSuccess && r.Outcome != OutcomeFailure) || r.Latency <= 0 {
 		return ErrInvalidResult
@@ -93,25 +95,35 @@ func (r Result) Validate() error {
 
 // Registration represents a leased service registration.
 type Registration interface {
+	// Done is closed when the registration is stopped or its lease is lost.
 	Done() <-chan struct{}
+	// Err reports the terminal keepalive error; an explicit Close leaves it nil.
 	Err() error
+	// Close revokes the lease and is safe to call more than once.
 	Close(context.Context) error
 }
 
 // Resolution binds an instance choice to exactly one result report.
 type Resolution interface {
+	// Endpoint returns the selected h2c URL without cloning instance metadata.
+	Endpoint() string
+	// Instance returns a defensive copy of the full selected instance descriptor.
 	Instance() Instance
+	// Report submits exactly one transport result for this resolution.
 	Report(Result) error
 }
 
 // Registrar registers leased service instances.
 type Registrar interface {
+	// Register creates a leased registration and starts keepalive maintenance.
 	Register(context.Context, Instance, time.Duration) (Registration, error)
 }
 
 // Resolver selects instances while maintaining discovery and health state internally.
 type Resolver interface {
+	// Resolve selects a currently usable instance for a service.
 	Resolve(context.Context, string) (Resolution, error)
+	// Close stops discovery watches and releases registry-owned state.
 	Close() error
 }
 
