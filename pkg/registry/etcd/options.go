@@ -12,11 +12,10 @@ type Options struct {
 	Prefix           string
 	FailureThreshold int
 	EjectionDuration time.Duration
-	ReportTimeout    time.Duration
 	InitialLatency   time.Duration
 	EWMAAlpha        float64
-	// CleanupInterval controls the shared report-expiry and service-eviction sweep.
-	CleanupInterval time.Duration
+	// ServiceSweepInterval controls how often idle service caches are considered for eviction.
+	ServiceSweepInterval time.Duration
 	// ServiceIdleTTL removes cached services and their watches after inactivity.
 	ServiceIdleTTL time.Duration
 	// RefreshInterval rate-limits full reloads while every instance is ejected.
@@ -36,17 +35,14 @@ func (o Options) withDefaults() (Options, error) {
 	if o.EjectionDuration == 0 {
 		o.EjectionDuration = 30 * time.Second
 	}
-	if o.ReportTimeout == 0 {
-		o.ReportTimeout = 10 * time.Second
-	}
 	if o.InitialLatency == 0 {
 		o.InitialLatency = 10 * time.Millisecond
 	}
 	if o.EWMAAlpha == 0 {
 		o.EWMAAlpha = .2
 	}
-	if o.CleanupInterval == 0 {
-		o.CleanupInterval = time.Second
+	if o.ServiceSweepInterval == 0 {
+		o.ServiceSweepInterval = 3 * time.Second
 	}
 	if o.ServiceIdleTTL == 0 {
 		o.ServiceIdleTTL = 10 * time.Minute
@@ -55,9 +51,9 @@ func (o Options) withDefaults() (Options, error) {
 		o.RefreshInterval = time.Second
 	}
 	if o.OperationTimeout == 0 {
-		o.OperationTimeout = 5 * time.Second
+		o.OperationTimeout = 3 * time.Second
 	}
-	if o.Prefix[0] != '/' || o.FailureThreshold < 1 || o.EjectionDuration < 0 || o.ReportTimeout <= 0 || o.InitialLatency <= 0 || o.EWMAAlpha <= 0 || o.EWMAAlpha > 1 || o.CleanupInterval <= 0 || o.ServiceIdleTTL <= 0 || o.RefreshInterval <= 0 || o.OperationTimeout <= 0 {
+	if o.Prefix[0] != '/' || o.FailureThreshold < 1 || o.EjectionDuration < 0 || o.InitialLatency <= 0 || o.EWMAAlpha <= 0 || o.EWMAAlpha > 1 || o.ServiceSweepInterval <= 0 || o.ServiceIdleTTL <= 0 || o.RefreshInterval <= 0 || o.OperationTimeout <= 0 {
 		return Options{}, errors.New("registry/etcd: invalid options")
 	}
 	for len(o.Prefix) > 1 && o.Prefix[len(o.Prefix)-1] == '/' {

@@ -23,11 +23,13 @@ func send(ctx context.Context, resolver registry.Resolver, request *http.Request
 	protocols.SetUnencryptedHTTP2(true)
 	transport := &http.Transport{Protocols: protocols}
 	started := time.Now()
+	outcome := registry.OutcomeFailure
+	defer func() {
+		_ = resolution.Report(registry.Result{Outcome: outcome, Latency: time.Since(started)})
+	}()
 	response, err := transport.RoundTrip(request)
-	outcome := registry.OutcomeSuccess
-	if err != nil {
-		outcome = registry.OutcomeFailure
+	if err == nil {
+		outcome = registry.OutcomeSuccess
 	}
-	_ = resolution.Report(registry.Result{Outcome: outcome, Latency: time.Since(started)})
 	return response, err
 }

@@ -56,9 +56,6 @@ type serviceState struct {
 	lastUsed    atomic.Int64
 	active      atomic.Int64
 	rng         atomic.Uint64
-	pendingMu   sync.Mutex
-	pending     *resolution
-	pendingTail *resolution
 	ctx         context.Context
 	cancel      context.CancelFunc
 }
@@ -209,15 +206,9 @@ func (s *serviceState) allEjected(now time.Time) bool {
 	return true
 }
 
-// canEvict checks inactivity, active Resolve calls, and pending result reports.
+// canEvict checks inactivity and active Resolve calls.
 func (s *serviceState) canEvict(now time.Time, idleTTL time.Duration) bool {
-	if s.active.Load() != 0 || now.Sub(time.Unix(0, s.lastUsed.Load())) < idleTTL {
-		return false
-	}
-	s.pendingMu.Lock()
-	empty := s.pending == nil
-	s.pendingMu.Unlock()
-	return empty
+	return s.active.Load() == 0 && now.Sub(time.Unix(0, s.lastUsed.Load())) >= idleTTL
 }
 
 // randomN returns a lock-free per-service pseudo-random index.
@@ -327,28 +318,16 @@ type resolution struct {
 	ejectionDuration time.Duration
 	failureThreshold int32
 	alpha            float64
-	deadline         time.Time
 	status           atomic.Uint32
-	prev, next       *resolution
 }
 
-// newResolution appends a report deadline to the service's ordered pending queue.
+// newResolution binds the selected instance to caller-owned result reporting.
 func newResolution(state *serviceState, selected *instanceState, options Options) *resolution {
-	r := &resolution{
+	return &resolution{
 		state: state, selected: selected, instance: selected.loadInstance(),
 		ejectionDuration: options.EjectionDuration, failureThreshold: int32(options.FailureThreshold),
-		alpha: options.EWMAAlpha, deadline: time.Now().Add(options.ReportTimeout),
+		alpha: options.EWMAAlpha,
 	}
-	state.pendingMu.Lock()
-	r.prev = state.pendingTail
-	if state.pendingTail != nil {
-		state.pendingTail.next = r
-	} else {
-		state.pending = r
-	}
-	state.pendingTail = r
-	state.pendingMu.Unlock()
-	return r
 }
 
 // Instance returns a defensive copy of the selected instance.
@@ -363,33 +342,10 @@ func (r *resolution) Report(result registry.Result) error {
 		return err
 	}
 	if !r.status.CompareAndSwap(0, 1) {
-		if r.status.Load() == 2 {
-			return registry.ErrReportExpired
-		}
 		return registry.ErrAlreadyReported
 	}
-	r.state.pendingMu.Lock()
-	r.unlinkLocked()
-	r.state.pendingMu.Unlock()
 	r.complete(&result, time.Now())
 	return nil
-}
-
-// expire removes ordered pending reports whose deadlines have elapsed.
-func (s *serviceState) expire(now time.Time) int {
-	expired := 0
-	s.pendingMu.Lock()
-	for current := s.pending; current != nil && !now.Before(current.deadline); current = s.pending {
-		if current.status.CompareAndSwap(0, 2) {
-			current.unlinkLocked()
-			current.complete(nil, now)
-			expired++
-		} else {
-			current.unlinkLocked()
-		}
-	}
-	s.pendingMu.Unlock()
-	return expired
 }
 
 // complete updates in-flight, EWMA, failure, ejection, and half-open state.
@@ -438,19 +394,4 @@ func updateEWMA(item *instanceState, latency time.Duration, alpha float64) {
 			return
 		}
 	}
-}
-
-// unlinkLocked removes the resolution from the pending list in O(1).
-func (r *resolution) unlinkLocked() {
-	if r.prev != nil {
-		r.prev.next = r.next
-	} else if r.state.pending == r {
-		r.state.pending = r.next
-	}
-	if r.next != nil {
-		r.next.prev = r.prev
-	} else if r.state.pendingTail == r {
-		r.state.pendingTail = r.prev
-	}
-	r.prev, r.next = nil, nil
 }

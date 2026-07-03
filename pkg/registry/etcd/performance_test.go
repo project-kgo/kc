@@ -9,7 +9,7 @@ import (
 )
 
 func BenchmarkResolutionLifecycle(b *testing.B) {
-	options, err := (Options{ReportTimeout: time.Hour}).withDefaults()
+	options, err := (Options{}).withDefaults()
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func BenchmarkResolutionLifecycle(b *testing.B) {
 }
 
 func BenchmarkRegistryResolveParallel(b *testing.B) {
-	options, err := (Options{ReportTimeout: time.Hour}).withDefaults()
+	options, err := (Options{}).withDefaults()
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func BenchmarkRegistryResolveParallel(b *testing.B) {
 }
 
 func TestResolutionLifecycleAllocationBudget(t *testing.T) {
-	options, err := (Options{ReportTimeout: time.Hour}).withDefaults()
+	options, err := (Options{}).withDefaults()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestResolutionLifecycleAllocationBudget(t *testing.T) {
 }
 
 func TestEndpointFastPathDoesNotCloneMetadata(t *testing.T) {
-	options, err := (Options{ReportTimeout: time.Hour}).withDefaults()
+	options, err := (Options{}).withDefaults()
 	if err != nil {
 		t.Fatal(err)
 	}

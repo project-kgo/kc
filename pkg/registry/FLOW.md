@@ -44,10 +44,8 @@ flowchart TB
         H8{"探测成功？"}
     end
 
-    subgraph Janitor["统一清理器"]
+    subgraph Sweeper["空闲服务回收器"]
         J1["每秒执行"]
-        J2["清理超时未 Report 的请求"]
-        J3["修正 inflight / 半开状态"]
         J4["回收长期未使用的服务缓存"]
         J5["停止对应 etcd Watch"]
     end
@@ -89,9 +87,6 @@ flowchart TB
     H8 -- 成功 --> H3
     H8 -- 失败 --> H6
 
-    J1 --> J2
-    J2 --> J3
-    J3 --> D5
     J1 --> J4
     J4 --> J5
 ```
@@ -102,4 +97,4 @@ flowchart TB
 2. Resolver 首次解析服务时执行全量 Get，随后从查询 revision 的下一版本开始增量 Watch。
 3. 每次请求通过 P2C 抽取两个健康实例，使用 `EWMA × (inflight + 1)` 评分并选择较低者。
 4. 调用方通过 `Report` 回传请求结果和延迟，用于更新 EWMA、连续失败数、摘除及半开状态。
-5. Janitor 统一清理超时未 Report 的请求，并回收长期未使用的服务缓存及 Watch。
+5. 调用方必须保证每次成功 Resolve 后调用一次 Report；空闲服务回收器只负责回收长期未使用的缓存和 Watch。

@@ -17,7 +17,7 @@ import (
 
 func TestRegisterResolveAndReport(t *testing.T) {
 	client := startEtcd(t)
-	r, err := New(client, Options{ReportTimeout: time.Second})
+	r, err := New(client, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,36 +115,9 @@ func TestWatchTracksAddedAndRemovedInstances(t *testing.T) {
 	_ = two.Close(ctx)
 }
 
-func TestRegistryJanitorExpiresResolution(t *testing.T) {
-	client := startEtcd(t)
-	r, err := New(client, Options{ReportTimeout: 20 * time.Millisecond, CleanupInterval: 5 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer r.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	registration, err := r.Register(ctx, registry.Instance{Service: "users", ID: "one", Endpoint: "http://127.0.0.1:8080"}, time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer registration.Close(ctx)
-	resolution, err := r.Resolve(ctx, "users")
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, ctx, func() bool { return r.Stats().PendingResolutions == 0 })
-	if got := r.Stats().ExpiredReports; got != 1 {
-		t.Fatalf("expected one expired report, got %d", got)
-	}
-	if err := resolution.Report(registry.Result{Outcome: registry.OutcomeSuccess, Latency: time.Millisecond}); !errors.Is(err, registry.ErrReportExpired) {
-		t.Fatalf("expected ErrReportExpired, got %v", err)
-	}
-}
-
 func TestIdleServiceStateIsEvicted(t *testing.T) {
 	client := startEtcd(t)
-	r, err := New(client, Options{ServiceIdleTTL: 20 * time.Millisecond, CleanupInterval: 5 * time.Millisecond})
+	r, err := New(client, Options{ServiceIdleTTL: 20 * time.Millisecond, ServiceSweepInterval: 5 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,8 +201,8 @@ func TestAllEjectedRefreshIsRateLimited(t *testing.T) {
 	}
 }
 
-func TestResolutionFailureEjectsAndTimeoutExpires(t *testing.T) {
-	options, err := (Options{FailureThreshold: 1, EjectionDuration: time.Second, ReportTimeout: 20 * time.Millisecond}).withDefaults()
+func TestResolutionFailureEjects(t *testing.T) {
+	options, err := (Options{FailureThreshold: 1, EjectionDuration: time.Second}).withDefaults()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,18 +215,6 @@ func TestResolutionFailureEjectsAndTimeoutExpires(t *testing.T) {
 	}
 	if selected.ejectedUntil.Load() == 0 {
 		t.Fatal("failed instance was not ejected")
-	}
-
-	selected.ejectedUntil.Store(0)
-	selected2, _ := state.pick(time.Now(), func(int) int { return 0 }, options.FailureThreshold, options.EjectionDuration)
-	expired := newResolution(state, selected2, options)
-	time.Sleep(50 * time.Millisecond)
-	state.expire(time.Now())
-	if err := expired.Report(registry.Result{Outcome: registry.OutcomeSuccess, Latency: time.Millisecond}); !errors.Is(err, registry.ErrReportExpired) {
-		t.Fatalf("expected ErrReportExpired, got %v", err)
-	}
-	if selected2.inflight.Load() != 0 {
-		t.Fatalf("expired resolution leaked inflight: %d", selected2.inflight.Load())
 	}
 }
 
@@ -353,7 +314,7 @@ func TestWatchBackoffOnlyResetsAfterHealthyResponse(t *testing.T) {
 }
 
 func TestConcurrentResolveReportAndMetadataUpdates(t *testing.T) {
-	options, err := (Options{ReportTimeout: time.Minute}).withDefaults()
+	options, err := (Options{}).withDefaults()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,12 +363,6 @@ func TestConcurrentResolveReportAndMetadataUpdates(t *testing.T) {
 		}
 	}
 	state.mu.RUnlock()
-	state.pendingMu.Lock()
-	pending := state.pending
-	state.pendingMu.Unlock()
-	if pending != nil {
-		t.Fatal("completed resolutions remained in pending queue")
-	}
 }
 
 func startEtcd(t *testing.T) *clientv3.Client {

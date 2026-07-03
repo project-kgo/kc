@@ -17,24 +17,23 @@ import (
 
 // Registry implements registry.Registry with etcd leases and watches.
 type Registry struct {
-	client         *clientv3.Client
-	options        Options
-	ctx            context.Context
-	cancel         context.CancelFunc
-	closeOnce      sync.Once
-	mu             sync.RWMutex
-	closed         bool
-	services       map[string]*serviceState
-	registrations  map[*registration]struct{}
-	wg             sync.WaitGroup
-	fullReloads    atomic.Uint64
-	watchEvents    atomic.Uint64
-	decodeErrors   atomic.Uint64
-	forcedRefresh  atomic.Uint64
-	expiredReports atomic.Uint64
-	watchRestarts  atomic.Uint64
-	refreshErrors  atomic.Uint64
-	serviceEvicts  atomic.Uint64
+	client        *clientv3.Client
+	options       Options
+	ctx           context.Context
+	cancel        context.CancelFunc
+	closeOnce     sync.Once
+	mu            sync.RWMutex
+	closed        bool
+	services      map[string]*serviceState
+	registrations map[*registration]struct{}
+	wg            sync.WaitGroup
+	fullReloads   atomic.Uint64
+	watchEvents   atomic.Uint64
+	decodeErrors  atomic.Uint64
+	forcedRefresh atomic.Uint64
+	watchRestarts atomic.Uint64
+	refreshErrors atomic.Uint64
+	serviceEvicts atomic.Uint64
 }
 
 // New creates a Registry using an externally owned etcd client.
@@ -52,7 +51,7 @@ func New(client *clientv3.Client, options Options) (*Registry, error) {
 		services: make(map[string]*serviceState), registrations: make(map[*registration]struct{}),
 	}
 	r.wg.Add(1)
-	go r.janitor()
+	go r.serviceSweeper()
 	return r, nil
 }
 
@@ -184,7 +183,7 @@ func (r *Registry) ensureService(service string) (*serviceState, error) {
 	if r.closed {
 		return nil, registry.ErrClosed
 	}
-	if state := r.services[service]; state != nil {
+	if state = r.services[service]; state != nil {
 		state.active.Add(1)
 		return state, nil
 	}
@@ -192,8 +191,11 @@ func (r *Registry) ensureService(service string) (*serviceState, error) {
 	state.ctx, state.cancel = context.WithCancel(r.ctx)
 	state.active.Store(1)
 	r.services[service] = state
+
 	r.wg.Add(1)
+
 	go r.watch(state)
+
 	return state, nil
 }
 
@@ -350,17 +352,15 @@ func (r *Registry) forceRefresh(ctx context.Context, state *serviceState) error 
 // Stats is a point-in-time operational snapshot. Counters are monotonic for
 // the lifetime of a Registry; gauges reflect current in-memory state.
 type Stats struct {
-	Services           int
-	Registrations      int
-	PendingResolutions int
-	FullReloads        uint64
-	WatchEvents        uint64
-	DecodeErrors       uint64
-	ForcedRefreshes    uint64
-	ExpiredReports     uint64
-	WatchRestarts      uint64
-	RefreshErrors      uint64
-	ServiceEvictions   uint64
+	Services         int
+	Registrations    int
+	FullReloads      uint64
+	WatchEvents      uint64
+	DecodeErrors     uint64
+	ForcedRefreshes  uint64
+	WatchRestarts    uint64
+	RefreshErrors    uint64
+	ServiceEvictions uint64
 }
 
 // Stats returns lock-safe counters and gauges suitable for metrics polling.
@@ -368,34 +368,26 @@ func (r *Registry) Stats() Stats {
 	result := Stats{
 		FullReloads: r.fullReloads.Load(), WatchEvents: r.watchEvents.Load(),
 		DecodeErrors: r.decodeErrors.Load(), ForcedRefreshes: r.forcedRefresh.Load(),
-		ExpiredReports: r.expiredReports.Load(), WatchRestarts: r.watchRestarts.Load(),
+		WatchRestarts: r.watchRestarts.Load(),
 		RefreshErrors: r.refreshErrors.Load(), ServiceEvictions: r.serviceEvicts.Load(),
 	}
 	r.mu.RLock()
 	result.Services = len(r.services)
 	result.Registrations = len(r.registrations)
-	for _, state := range r.services {
-		state.pendingMu.Lock()
-		for pending := state.pending; pending != nil; pending = pending.next {
-			result.PendingResolutions++
-		}
-		state.pendingMu.Unlock()
-	}
 	r.mu.RUnlock()
 	return result
 }
 
-// janitor expires missing reports and evicts idle service watches using one ticker.
-func (r *Registry) janitor() {
+// serviceSweeper evicts idle service caches and their watches using one ticker.
+func (r *Registry) serviceSweeper() {
 	defer r.wg.Done()
-	ticker := time.NewTicker(r.options.CleanupInterval)
+	ticker := time.NewTicker(r.options.ServiceSweepInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case now := <-ticker.C:
 			r.mu.Lock()
 			for name, state := range r.services {
-				r.expiredReports.Add(uint64(state.expire(now)))
 				idle := state.canEvict(now, r.options.ServiceIdleTTL)
 				if idle && r.services[name] == state {
 					state.cancel()

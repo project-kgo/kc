@@ -17,7 +17,6 @@ var (
 	ErrNoAvailableInstance = errors.New("registry: no available instance")
 	ErrClosed              = errors.New("registry: closed")
 	ErrAlreadyReported     = errors.New("registry: resolution already reported")
-	ErrReportExpired       = errors.New("registry: resolution report expired")
 )
 
 // Instance describes one h2c service instance.

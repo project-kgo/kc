@@ -31,16 +31,16 @@ if err != nil {
 }
 
 started := time.Now()
+outcome := registry.OutcomeFailure
+defer func() {
+    _ = resolved.Report(registry.Result{
+        Outcome: outcome,
+        Latency: time.Since(started),
+    })
+}()
 response, err := transport.RoundTrip(requestFor(resolved.Endpoint()))
-outcome := registry.OutcomeSuccess
-if err != nil {
-    outcome = registry.OutcomeFailure
-}
-if reportErr := resolved.Report(registry.Result{
-    Outcome: outcome,
-    Latency: time.Since(started),
-}); reportErr != nil {
-    return reportErr
+if err == nil {
+    outcome = registry.OutcomeSuccess
 }
 ```
 
@@ -51,8 +51,9 @@ Only connection failures, timeouts, and HTTP/2 transport failures should be repo
 - Resolver discovery uses an initial linearizable Get followed by revision-ordered incremental watch updates. Full reloads occur only during initial load, watch recovery, compaction, or rate-limited all-ejected refreshes.
 - P2C selection uses per-service random state and atomic health counters. The request path does not allocate candidate slices or create per-request timers.
 - Use `Resolution.Endpoint()` on the request path; `Instance()` intentionally deep-copies metadata and is intended for callers that need the full descriptor.
-- A single Registry janitor expires unreported resolutions and removes idle service watches. `ServiceIdleTTL`, `CleanupInterval`, `ReportTimeout`, and `RefreshInterval` can be tuned through `registryetcd.Options`.
-- `Registry.Stats()` exposes service, registration, and pending-resolution gauges plus full reload, watch event, decode error, forced refresh, refresh error, watch restart, expired report, and service eviction counters.
+- Callers own the request-result lifecycle and must report every successful resolution exactly once. A `defer` immediately after `Resolve` is recommended so all return paths report a result.
+- A single service sweeper removes idle service watches. `ServiceIdleTTL`, `ServiceSweepInterval`, and `RefreshInterval` can be tuned through `registryetcd.Options`.
+- `Registry.Stats()` exposes service and registration gauges plus full reload, watch event, decode error, forced refresh, refresh error, watch restart, and service eviction counters.
 - Corrupt instance values are isolated and counted instead of stopping discovery for the entire service. Monitor `DecodeErrors` and repair invalid etcd values promptly.
 
-Default resource controls are a 10-second report timeout, 1-second cleanup interval, 10-minute idle service TTL, 1-second forced-refresh cooldown, and 5-second internal etcd operation timeout.
+Default resource controls are a 1-second service sweep interval, 10-minute idle service TTL, 1-second forced-refresh cooldown, and 5-second internal etcd operation timeout.
