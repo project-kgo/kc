@@ -1,9 +1,11 @@
-// Package connectrpc provides Connect clients backed by service discovery.
+// Package connectrpc provides Connect clients backed by service discovery or direct URLs.
 package connectrpc
 
 import (
 	"errors"
 	"net/http"
+	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -71,19 +73,53 @@ type Client struct {
 }
 
 func New(service string, resolver registry.Resolver, options ...Option) (*Client, error) {
+	return NewDiscovery(service, resolver, options...)
+}
+
+func NewDiscovery(service string, resolver registry.Resolver, options ...Option) (*Client, error) {
 	if strings.TrimSpace(service) == "" || strings.ContainsAny(service, `/\\`) {
 		return nil, errors.New("connectrpc client: invalid service")
 	}
 	if resolver == nil {
 		return nil, errors.New("connectrpc client: nil resolver")
 	}
+	cfg, base, clientOptions, err := buildConfig(options...)
+	if err != nil {
+		return nil, err
+	}
+	transport := &discoveryTransport{service: service, resolver: resolver, base: base}
+	return &Client{
+		httpClient: &http.Client{Transport: transport, Timeout: cfg.timeout},
+		baseURL:    "http://connectrpc.invalid",
+		options:    clientOptions,
+		transport:  transport,
+	}, nil
+}
+
+func NewDirect(baseURL string, options ...Option) (*Client, error) {
+	endpoint, err := parseBaseURL(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	cfg, base, clientOptions, err := buildConfig(options...)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{
+		httpClient: &http.Client{Transport: base, Timeout: cfg.timeout},
+		baseURL:    endpoint,
+		options:    clientOptions,
+	}, nil
+}
+
+func buildConfig(options ...Option) (config, http.RoundTripper, []connect.ClientOption, error) {
 	cfg := config{http1: true, h2c: true}
 	for _, option := range options {
 		if option == nil {
-			return nil, errors.New("connectrpc client: nil option")
+			return config{}, nil, nil, errors.New("connectrpc client: nil option")
 		}
 		if err := option(&cfg); err != nil {
-			return nil, err
+			return config{}, nil, nil, err
 		}
 	}
 	base := cfg.roundTripper
@@ -93,12 +129,36 @@ func New(service string, resolver registry.Resolver, options ...Option) (*Client
 		protocols.SetUnencryptedHTTP2(cfg.h2c)
 		base = &http.Transport{Protocols: protocols}
 	}
-	transport := &discoveryTransport{service: service, resolver: resolver, base: base}
 	clientOptions := make([]connect.ClientOption, 0, 1)
 	if len(cfg.interceptors) > 0 {
 		clientOptions = append(clientOptions, connect.WithInterceptors(cfg.interceptors...))
 	}
-	return &Client{httpClient: &http.Client{Transport: transport, Timeout: cfg.timeout}, baseURL: "http://connectrpc.invalid", options: clientOptions, transport: transport}, nil
+	return cfg, base, clientOptions, nil
+}
+
+func parseBaseURL(raw string) (string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return "", errors.New("connectrpc client: invalid base URL")
+	}
+	endpoint, err := url.Parse(raw)
+	if err != nil {
+		return "", errors.New("connectrpc client: invalid base URL")
+	}
+	if endpoint.Scheme == "" || endpoint.Host == "" {
+		return "", errors.New("connectrpc client: invalid base URL")
+	}
+	if endpoint.RawQuery != "" || endpoint.Fragment != "" {
+		return "", errors.New("connectrpc client: base URL must not include query or fragment")
+	}
+	if endpoint.Scheme != "http" && endpoint.Scheme != "https" {
+		return "", errors.New("connectrpc client: unsupported base URL scheme")
+	}
+	cleaned := *endpoint
+	cleaned.Path = path.Clean("/" + strings.TrimSpace(endpoint.Path))
+	if cleaned.Path == "/" {
+		cleaned.Path = ""
+	}
+	return strings.TrimSuffix(cleaned.String(), "/"), nil
 }
 
 func (c *Client) HTTPClient() *http.Client { return c.httpClient }

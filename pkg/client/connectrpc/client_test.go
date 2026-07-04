@@ -49,7 +49,7 @@ func TestClientRewritesEndpointAndReportsSuccess(t *testing.T) {
 	resolution := &fakeResolution{endpoint: "http://127.0.0.1:9090"}
 	resolver := &fakeResolver{resolution: resolution}
 	var got *http.Request
-	c, err := New("users.v1", resolver, WithRoundTripper(roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	c, err := NewDiscovery("users.v1", resolver, WithRoundTripper(roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		got = r
 		return &http.Response{StatusCode: http.StatusInternalServerError, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("x")), Request: r}, nil
 	})))
@@ -76,7 +76,7 @@ func TestClientRewritesEndpointAndReportsSuccess(t *testing.T) {
 func TestClientReportsTransportFailure(t *testing.T) {
 	resolution := &fakeResolution{endpoint: "http://127.0.0.1:9090"}
 	want := errors.New("dial failed")
-	c, err := New("users.v1", &fakeResolver{resolution: resolution}, WithRoundTripper(roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, want })))
+	c, err := NewDiscovery("users.v1", &fakeResolver{resolution: resolution}, WithRoundTripper(roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, want })))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestClientReportsTransportFailure(t *testing.T) {
 }
 
 func TestDefaultProtocolsEnableHTTP1AndH2C(t *testing.T) {
-	c, err := New("users.v1", &fakeResolver{resolution: &fakeResolution{}}, WithHTTPTimeout(time.Second))
+	c, err := NewDiscovery("users.v1", &fakeResolver{resolution: &fakeResolution{}}, WithHTTPTimeout(time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,6 +101,56 @@ func TestDefaultProtocolsEnableHTTP1AndH2C(t *testing.T) {
 	}
 	if !transport.Protocols.HTTP1() || !transport.Protocols.UnencryptedHTTP2() {
 		t.Fatalf("unexpected protocols: %s", transport.Protocols)
+	}
+}
+
+func TestNewRemainsDiscoveryAlias(t *testing.T) {
+	c, err := New("users.v1", &fakeResolver{resolution: &fakeResolution{}}, WithHTTPTimeout(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.transport == nil {
+		t.Fatal("expected discovery transport")
+	}
+}
+
+func TestDirectClientUsesConfiguredBaseURL(t *testing.T) {
+	var got *http.Request
+	c, err := NewDirect("http://127.0.0.1:8080/api", WithRoundTripper(roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		got = r
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), Request: r}, nil
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, _ := http.NewRequest(http.MethodPost, c.BaseURL()+"/users.v1.User/Get", nil)
+	response, err := c.HTTPClient().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if got.URL.String() != "http://127.0.0.1:8080/api/users.v1.User/Get" {
+		t.Fatalf("unexpected target %s", got.URL.String())
+	}
+	if c.transport != nil {
+		t.Fatal("direct client should not use discovery transport")
+	}
+}
+
+func TestDirectClientRejectsInvalidBaseURL(t *testing.T) {
+	cases := []string{
+		"",
+		"users.v1",
+		"/relative",
+		"http://127.0.0.1:8080?x=1",
+		"http://127.0.0.1:8080#frag",
+	}
+	for _, baseURL := range cases {
+		t.Run(baseURL, func(t *testing.T) {
+			if _, err := NewDirect(baseURL); err == nil {
+				t.Fatalf("expected error for %q", baseURL)
+			}
+		})
 	}
 }
 
