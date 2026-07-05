@@ -3,6 +3,19 @@
 `Server` serves generated Connect handlers over HTTP/1.1 and h2c. Connect,
 gRPC, and gRPC-Web wire protocols remain enabled by the generated handlers.
 
+Configure the process-wide OpenTelemetry propagator before constructing trace
+interceptors. ConnectRPC then uses the same trace context and baggage formats as
+the rest of the application:
+
+```go
+otel.SetTextMapPropagator(
+	propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	),
+)
+```
+
 ```go
 trace, err := connectrpc.Trace()
 if err != nil {
@@ -33,6 +46,11 @@ if err := server.HandleFactory(func(options ...connect.HandlerOption) (string, h
 }
 return server.Run(ctx)
 ```
+
+`Trace` trusts incoming remote span context by default, so internal RPC server
+spans remain in the caller's trace and use the incoming SpanID as their parent.
+Only use this default on trusted internal traffic; terminate or isolate
+untrusted public traffic at a gateway.
 
 `HandleFactory` is the recommended registration API. It always applies global
 handler options before any handler-local options:

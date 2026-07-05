@@ -7,6 +7,19 @@ The package supports two creation modes:
   arrive. Connect business errors are successful transport results.
 - `NewDirect`: connect to a fixed base URL directly, without a resolver.
 
+`Trace` uses the process-wide OpenTelemetry text map propagator. Configure it
+before constructing the interceptor so client requests inject the same trace
+context and baggage formats used by the server:
+
+```go
+otel.SetTextMapPropagator(
+	propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	),
+)
+```
+
 ```go
 trace, err := clientconnect.Trace()
 if err != nil {

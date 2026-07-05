@@ -9,6 +9,11 @@ import (
 	"testing"
 
 	"connectrpc.com/connect"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/baggage"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -58,12 +63,55 @@ func TestRateLimitRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
-func TestTraceBuildsWithW3CDefault(t *testing.T) {
+func TestTraceUsesGlobalPropagatorToExtractTraceAndBaggage(t *testing.T) {
+	originalPropagator := otel.GetTextMapPropagator()
+	originalTracerProvider := otel.GetTracerProvider()
+	tracerProvider := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.AlwaysSample()))
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+	otel.SetTracerProvider(tracerProvider)
+	t.Cleanup(func() {
+		_ = tracerProvider.Shutdown(context.Background())
+		otel.SetTracerProvider(originalTracerProvider)
+		otel.SetTextMapPropagator(originalPropagator)
+	})
+
 	interceptor, err := Trace()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if interceptor == nil {
-		t.Fatal("nil trace interceptor")
+	var gotTraceID trace.TraceID
+	var gotSpanID trace.SpanID
+	var gotTenant string
+	handler := connect.NewUnaryHandler(
+		"/test.Service/Trace",
+		func(ctx context.Context, _ *connect.Request[emptypb.Empty]) (*connect.Response[emptypb.Empty], error) {
+			spanContext := trace.SpanContextFromContext(ctx)
+			gotTraceID = spanContext.TraceID()
+			gotSpanID = spanContext.SpanID()
+			gotTenant = baggage.FromContext(ctx).Member("tenant").Value()
+			return connect.NewResponse(&emptypb.Empty{}), nil
+		},
+		connect.WithInterceptors(interceptor),
+	)
+	request := httptest.NewRequest(http.MethodPost, "/test.Service/Trace", strings.NewReader(`{}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+	request.Header.Set("Baggage", "tenant=acme")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", response.Code, response.Body.String())
+	}
+	if gotTraceID.String() != "4bf92f3577b34da6a3ce929d0e0e4736" {
+		t.Fatalf("trace=%s span=%s", gotTraceID, gotSpanID)
+	}
+	if gotSpanID.String() == "00f067aa0ba902b7" || !gotSpanID.IsValid() {
+		t.Fatalf("server did not create a child span: %s", gotSpanID)
+	}
+	if gotTenant != "acme" {
+		t.Fatalf("tenant=%q", gotTenant)
 	}
 }

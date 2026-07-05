@@ -10,7 +10,13 @@ import (
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/project-kgo/kc/pkg/registry"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/baggage"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 type fakeResolver struct {
@@ -291,12 +297,57 @@ func TestDirectClientRejectsInvalidBaseURL(t *testing.T) {
 	}
 }
 
-func TestTraceBuildsWithW3CDefault(t *testing.T) {
+func TestTraceUsesGlobalPropagatorToInjectTraceAndBaggage(t *testing.T) {
+	original := otel.GetTextMapPropagator()
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+	t.Cleanup(func() { otel.SetTextMapPropagator(original) })
+
 	interceptor, err := Trace()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if interceptor == nil {
-		t.Fatal("nil trace interceptor")
+	var traceparent, baggageHeader string
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		traceparent = request.Header.Get("Traceparent")
+		baggageHeader = request.Header.Get("Baggage")
+		return nil, errors.New("stop after headers")
+	})}
+	client := connect.NewClient[emptypb.Empty, emptypb.Empty](
+		httpClient,
+		"http://example.com/test.Service/Trace",
+		connect.WithInterceptors(interceptor),
+	)
+	traceID, err := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spanID, err := trace.SpanIDFromHex("00f067aa0ba902b7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := trace.ContextWithSpanContext(context.Background(), trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    traceID,
+		SpanID:     spanID,
+		TraceFlags: trace.FlagsSampled,
+	}))
+	member, err := baggage.NewMember("tenant", "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bag, err := baggage.New(member)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx = baggage.ContextWithBaggage(ctx, bag)
+	_, _ = client.CallUnary(ctx, connect.NewRequest(&emptypb.Empty{}))
+
+	if !strings.Contains(traceparent, traceID.String()) || !strings.Contains(traceparent, spanID.String()) {
+		t.Fatalf("traceparent=%q", traceparent)
+	}
+	if baggageHeader != "tenant=acme" {
+		t.Fatalf("baggage=%q", baggageHeader)
 	}
 }

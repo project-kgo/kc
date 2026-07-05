@@ -3,11 +3,10 @@ package connectrpc
 import (
 	"connectrpc.com/connect"
 	"connectrpc.com/otelconnect"
-	"go.opentelemetry.io/otel/propagation"
 )
 
-// Trace creates a client-capable OpenTelemetry interceptor using W3C trace context.
+// Trace creates a client-capable OpenTelemetry interceptor using the global
+// OpenTelemetry text map propagator unless explicitly overridden by an option.
 func Trace(options ...otelconnect.Option) (connect.Interceptor, error) {
-	defaults := []otelconnect.Option{otelconnect.WithPropagator(propagation.TraceContext{})}
-	return otelconnect.NewInterceptor(append(defaults, options...)...)
+	return otelconnect.NewInterceptor(options...)
 }
