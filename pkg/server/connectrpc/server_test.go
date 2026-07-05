@@ -60,6 +60,75 @@ func TestServerDefaultsAndGlobalLocalInterceptors(t *testing.T) {
 	}
 }
 
+func TestHandleFactoryAppliesGlobalAndLocalInterceptors(t *testing.T) {
+	var global, local atomic.Int32
+	server, err := New(WithInterceptors(countingInterceptor{&global}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	factory := func(options ...connect.HandlerOption) (string, http.Handler) {
+		return emptyHandler(options...)
+	}
+	if err := server.HandleFactory(factory, connect.WithInterceptors(countingInterceptor{&local})); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/test.Service/Empty", nil)
+	request.Header.Set("Content-Type", "application/proto")
+	response := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", response.Code, response.Body.String())
+	}
+	if global.Load() != 1 || local.Load() != 1 {
+		t.Fatalf("global=%d local=%d", global.Load(), local.Load())
+	}
+}
+
+func TestHandleFactoryRejectsInvalidInput(t *testing.T) {
+	server, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.HandleFactory(nil); err == nil {
+		t.Fatal("expected nil factory error")
+	}
+	if err := server.HandleFactory(func(...connect.HandlerOption) (string, http.Handler) {
+		return "", nil
+	}); err == nil {
+		t.Fatal("expected invalid handler error")
+	}
+}
+
+func TestHandleFactoryUsesHandleValidation(t *testing.T) {
+	server, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	factory := func(options ...connect.HandlerOption) (string, http.Handler) {
+		return emptyHandler(options...)
+	}
+	if err := server.HandleFactory(factory); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.HandleFactory(factory); err == nil {
+		t.Fatal("expected duplicate path error")
+	}
+
+	running, err := New(WithListener(&fakeListener{closed: make(chan struct{})}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := running.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := running.HandleFactory(factory); err == nil {
+		t.Fatal("expected registration after Run error")
+	}
+}
+
 type fakeRegistration struct {
 	closed atomic.Bool
 	done   chan struct{}

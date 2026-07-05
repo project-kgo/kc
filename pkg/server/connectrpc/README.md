@@ -26,14 +26,30 @@ server, err := connectrpc.New(
 if err != nil {
     return err
 }
-if err := server.Handle(usersv1connect.NewUserServiceHandler(
-    service,
-    server.HandlerOptions()...,
-)); err != nil {
-    return err
+if err := server.HandleFactory(func(options ...connect.HandlerOption) (string, http.Handler) {
+	return usersv1connect.NewUserServiceHandler(service, options...)
+}); err != nil {
+	return err
 }
 return server.Run(ctx)
 ```
+
+`HandleFactory` is the recommended registration API. It always applies global
+handler options before any handler-local options:
+
+```go
+err := server.HandleFactory(
+	func(options ...connect.HandlerOption) (string, http.Handler) {
+		return usersv1connect.NewUserServiceHandler(service, options...)
+	},
+	connect.WithInterceptors(serviceInterceptor),
+)
+```
+
+`Handle` remains available for compatibility and for registering arbitrary
+HTTP handlers, but it cannot apply Connect handler options after a handler has
+already been constructed. `HandlerOptions` remains available to support code
+that must construct generated handlers outside `HandleFactory`.
 
 Registry endpoints must be explicitly advertised; listener addresses such as
 `0.0.0.0` are never guessed. `Run` unregisters before draining HTTP requests.

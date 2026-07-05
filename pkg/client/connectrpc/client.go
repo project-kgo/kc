@@ -18,6 +18,8 @@ type Option func(*config) error
 type config struct {
 	roundTripper http.RoundTripper
 	timeout      time.Duration
+	preset       TransportPreset
+	protocolsSet bool
 	http1        bool
 	h2c          bool
 	interceptors []connect.Interceptor
@@ -48,7 +50,17 @@ func WithProtocols(http1, unencryptedHTTP2 bool) Option {
 		if !http1 && !unencryptedHTTP2 {
 			return errors.New("connectrpc client: at least one HTTP protocol is required")
 		}
+		c.protocolsSet = true
 		c.http1, c.h2c = http1, unencryptedHTTP2
+		return nil
+	}
+}
+
+// WithTransportPreset selects production-oriented defaults for the built-in
+// HTTP transport. It has no effect when WithRoundTripper is also supplied.
+func WithTransportPreset(preset TransportPreset) Option {
+	return func(c *config) error {
+		c.preset = preset
 		return nil
 	}
 }
@@ -113,7 +125,7 @@ func NewDirect(baseURL string, options ...Option) (*Client, error) {
 }
 
 func buildConfig(options ...Option) (config, http.RoundTripper, []connect.ClientOption, error) {
-	cfg := config{http1: true, h2c: true}
+	cfg := config{preset: TransportInternal}
 	for _, option := range options {
 		if option == nil {
 			return config{}, nil, nil, errors.New("connectrpc client: nil option")
@@ -122,12 +134,17 @@ func buildConfig(options ...Option) (config, http.RoundTripper, []connect.Client
 			return config{}, nil, nil, err
 		}
 	}
+	transportConfig, err := cfg.preset.config()
+	if err != nil {
+		return config{}, nil, nil, err
+	}
 	base := cfg.roundTripper
 	if base == nil {
-		protocols := new(http.Protocols)
-		protocols.SetHTTP1(cfg.http1)
-		protocols.SetUnencryptedHTTP2(cfg.h2c)
-		base = &http.Transport{Protocols: protocols}
+		if cfg.protocolsSet {
+			transportConfig.http1 = cfg.http1
+			transportConfig.h2c = cfg.h2c
+		}
+		base = transportConfig.transport()
 	}
 	clientOptions := make([]connect.ClientOption, 0, 1)
 	if len(cfg.interceptors) > 0 {

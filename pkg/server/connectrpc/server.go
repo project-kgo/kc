@@ -30,6 +30,10 @@ type Server struct {
 	listener        net.Listener
 }
 
+// HandlerFactory constructs a generated Connect handler with the supplied
+// handler options.
+type HandlerFactory func(...connect.HandlerOption) (string, http.Handler)
+
 func New(options ...Option) (*Server, error) {
 	cfg := config{address: ":8080", http1: true, h2c: true, readHeaderTimeout: 10 * time.Second, idleTimeout: 2 * time.Minute, shutdownTimeout: 30 * time.Second}
 	for _, option := range options {
@@ -55,8 +59,18 @@ func (s *Server) HandlerOptions(local ...connect.HandlerOption) []connect.Handle
 	return append(options, local...)
 }
 
-// Handle registers a generated Connect handler. Call HandlerOptions while
-// constructing the handler to apply the server's global options.
+// HandleFactory registers a generated Connect handler after applying the
+// server's global handler options followed by handler-local options.
+func (s *Server) HandleFactory(factory HandlerFactory, local ...connect.HandlerOption) error {
+	if factory == nil {
+		return errors.New("connectrpc server: nil handler factory")
+	}
+	path, handler := factory(s.HandlerOptions(local...)...)
+	return s.Handle(path, handler)
+}
+
+// Handle registers an already-constructed HTTP handler. It is a low-level
+// compatibility API and does not apply the server's global handler options.
 func (s *Server) Handle(path string, handler http.Handler) error {
 	if strings.TrimSpace(path) == "" || handler == nil {
 		return errors.New("connectrpc server: invalid handler")
