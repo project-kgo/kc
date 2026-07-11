@@ -2,7 +2,7 @@
 
 ## 目标
 
-服务端收到退出信号后，先在 `shutdownTimeout` 内等待活动 HTTP 请求自然结束；超过该期限时，强制关闭剩余普通 HTTP 连接，确保 `Server.Run` 返回前这些请求不再继续运行。
+服务端收到退出信号后，先在 `shutdownTimeout` 内等待活动 HTTP 请求自然结束；超过该期限时，强制关闭剩余普通 HTTP 连接并取消对应的请求 context。handler 仍需遵循 Go HTTP 约定，响应 context 取消信号。
 
 ## 行为
 
@@ -14,5 +14,4 @@
 
 ## 测试
 
-增加一个使用真实监听器和阻塞 handler 的回归测试：请求进入 handler 后取消服务端运行 context，验证优雅退出超时会令 `Run` 返回 `context.DeadlineExceeded`，并且强制关闭会取消请求 context，使 handler 在 `Run` 返回前结束。
-
+增加一个使用内存连接和阻塞 handler 的回归测试：请求进入 handler 后取消服务端运行 context，验证优雅退出超时会令 `Run` 返回 `context.DeadlineExceeded`，并且强制关闭会取消请求 context，使遵循 context 的 handler 随后结束。

@@ -154,7 +154,11 @@ func (s *Server) Run(ctx context.Context) error {
 	if registration != nil {
 		cause = errors.Join(cause, registration.Close(shutdownCtx))
 	}
-	cause = errors.Join(cause, s.httpServer.Shutdown(shutdownCtx))
+	shutdownErr := s.httpServer.Shutdown(shutdownCtx)
+	if shutdownErr != nil {
+		shutdownErr = errors.Join(shutdownErr, s.httpServer.Close())
+	}
+	cause = errors.Join(cause, shutdownErr)
 	return cause
 }
 

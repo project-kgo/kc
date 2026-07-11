@@ -3,9 +3,11 @@ package connectrpc
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -174,6 +176,80 @@ type fakeAddr string
 
 func (a fakeAddr) Network() string { return string(a) }
 func (a fakeAddr) String() string  { return string(a) }
+
+type singleConnListener struct {
+	conn   chan net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (l *singleConnListener) Accept() (net.Conn, error) {
+	select {
+	case conn := <-l.conn:
+		return conn, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *singleConnListener) Close() error {
+	l.once.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (*singleConnListener) Addr() net.Addr { return fakeAddr("pipe") }
+
+func TestServerRunForceClosesActiveConnectionAfterShutdownTimeout(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+	listener := &singleConnListener{conn: make(chan net.Conn, 1), closed: make(chan struct{})}
+	listener.conn <- serverConn
+
+	server, err := New(
+		WithListener(listener),
+		WithTimeouts(time.Second, time.Second, 20*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	if err := server.Handle("/block", http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		close(started)
+		<-request.Context().Done()
+		close(stopped)
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() { runErr <- server.Run(runCtx) }()
+	go func() {
+		_, _ = io.WriteString(clientConn, "GET /block HTTP/1.1\r\nHost: test\r\n\r\n")
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not start")
+	}
+	cancelRun()
+
+	select {
+	case err := <-runErr:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Run error = %v, want context deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return after shutdown timeout")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("active request context was not canceled after shutdown timeout")
+	}
+}
 
 func TestServerRunRegistersAndClosesRegistration(t *testing.T) {
 	registration := &fakeRegistration{done: make(chan struct{})}
