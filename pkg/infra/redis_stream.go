@@ -688,8 +688,8 @@ func marshalRedisStreamMessage(message *coremq.Message) ([]interface{}, error) {
 	}
 	return []interface{}{
 		redisStreamFieldVersion, redisStreamMessageVersion,
-		redisStreamFieldKey, cloneBytes(message.Key),
-		redisStreamFieldBody, cloneBytes(message.Body),
+		redisStreamFieldKey, cloneRedisStreamBytes(message.Key),
+		redisStreamFieldBody, cloneRedisStreamBytes(message.Body),
 		redisStreamFieldHeaders, headers,
 		redisStreamFieldTimestamp, strconv.FormatInt(timestamp, 10),
 	}, nil
@@ -742,8 +742,8 @@ func messageFromRedisStreamRecord(record redis.XMessage) (*coremq.Message, error
 	}
 	return &coremq.Message{
 		ID:        record.ID,
-		Key:       cloneBytes(key),
-		Body:      cloneBytes(body),
+		Key:       cloneRedisStreamBytes(key),
+		Body:      cloneRedisStreamBytes(body),
 		Headers:   headers,
 		Timestamp: timestamp,
 	}, nil
@@ -758,10 +758,17 @@ func redisStreamValueBytes(values map[string]interface{}, key string) ([]byte, e
 	case string:
 		return []byte(typed), nil
 	case []byte:
-		return cloneBytes(typed), nil
+		return cloneRedisStreamBytes(typed), nil
 	default:
 		return nil, fmt.Errorf("redis stream field %q has type %T", key, value)
 	}
+}
+
+func cloneRedisStreamBytes(value []byte) []byte {
+	if value == nil {
+		return nil
+	}
+	return append([]byte(nil), value...)
 }
 
 func (s *redisStreamRedisStore) Close() error {

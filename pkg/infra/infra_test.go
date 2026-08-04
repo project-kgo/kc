@@ -12,7 +12,6 @@ import (
 	. "github.com/project-kgo/kc/pkg/mq"
 	"github.com/project-kgo/kc/pkg/resource"
 	"github.com/redis/go-redis/v9"
-	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 func TestInitRegistersDataAndMQWithoutNetworkChecks(t *testing.T) {
@@ -36,9 +35,9 @@ func TestInitRegistersDataAndMQWithoutNetworkChecks(t *testing.T) {
 			},
 		},
 		MQ: map[string]MQConfig{
-			"infra-test-kafka": {
-				Type: MQTypeKafka, SkipCheck: true,
-				Kafka: &KafkaConfig{Brokers: []string{"127.0.0.1:9092", "127.0.0.1:9093"}},
+			"infra-test-redis-stream-base": {
+				Type: MQTypeRedisStream, DSN: "redis://127.0.0.1:6379/0", SkipCheck: true,
+				RedisStream: &RedisStreamConfig{},
 			},
 		},
 	}
@@ -54,10 +53,7 @@ func TestInitRegistersDataAndMQWithoutNetworkChecks(t *testing.T) {
 	redisClient := mustResource[*redis.Client](t, "infra-test-redis")
 	redisCluster := mustResource[*redis.ClusterClient](t, "infra-test-redis-cluster")
 	elasticsearchClient := mustResource[*elasticsearch.TypedClient](t, "infra-test-elasticsearch")
-	kafkaClient := mustResource[MQ](t, "infra-test-kafka")
-	if _, ok := resource.Get[*kgo.Client]("infra-test-kafka"); ok {
-		t.Fatal("Kafka concrete client must not be registered")
-	}
+	mqClient := mustResource[MQ](t, "infra-test-redis-stream-base")
 
 	_ = mysqlDB.Close()
 	_ = postgresDB.Close()
@@ -66,7 +62,7 @@ func TestInitRegistersDataAndMQWithoutNetworkChecks(t *testing.T) {
 	closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	_ = elasticsearchClient.Close(closeCtx)
 	cancel()
-	_ = kafkaClient.Close()
+	_ = mqClient.Close()
 }
 
 func TestInitAllowsSameNameAcrossDataAndMQ(t *testing.T) {
@@ -76,7 +72,10 @@ func TestInitAllowsSameNameAcrossDataAndMQ(t *testing.T) {
 			name: {Type: DataTypeRedis, DSN: "redis://127.0.0.1:6379/0", SkipCheck: true},
 		},
 		MQ: map[string]MQConfig{
-			name: {Type: MQTypeKafka, SkipCheck: true, Kafka: &KafkaConfig{Brokers: []string{"127.0.0.1:9092"}}},
+			name: {
+				Type: MQTypeRedisStream, DSN: "redis://127.0.0.1:6379/0", SkipCheck: true,
+				RedisStream: &RedisStreamConfig{},
+			},
 		},
 	}
 	if err := Init(context.Background(), config); err != nil {
@@ -84,9 +83,9 @@ func TestInitAllowsSameNameAcrossDataAndMQ(t *testing.T) {
 	}
 
 	redisClient := mustResource[*redis.Client](t, name)
-	kafkaClient := mustResource[MQ](t, name)
+	mqClient := mustResource[MQ](t, name)
 	_ = redisClient.Close()
-	_ = kafkaClient.Close()
+	_ = mqClient.Close()
 }
 
 func TestInitRegistersRedisStreamMQWithoutNetworkCheck(t *testing.T) {
@@ -151,7 +150,7 @@ func TestInitChecksConnectivityAndDoesNotPublishPartialConfig(t *testing.T) {
 	cancel()
 
 	const dataName = "infra-test-rollback-mysql"
-	const mqName = "infra-test-rollback-kafka"
+	const mqName = "infra-test-rollback-redis-stream"
 	config := Config{
 		Data: map[string]DataConfig{
 			dataName: {
@@ -160,7 +159,7 @@ func TestInitChecksConnectivityAndDoesNotPublishPartialConfig(t *testing.T) {
 		},
 		MQ: map[string]MQConfig{
 			mqName: {
-				Type: MQTypeKafka, Kafka: &KafkaConfig{Brokers: []string{"127.0.0.1:9092"}},
+				Type: MQTypeRedisStream, DSN: "redis://127.0.0.1:6379/0", RedisStream: &RedisStreamConfig{},
 			},
 		},
 	}
@@ -229,7 +228,7 @@ func TestRollbackClosesInReverseOrderAndJoinsErrors(t *testing.T) {
 			order = append(order, 1)
 			return closeErr
 		}},
-		{name: "second", module: "mq", typ: string(MQTypeKafka), close: func(context.Context) error {
+		{name: "second", module: "mq", typ: string(MQTypeRedisStream), close: func(context.Context) error {
 			order = append(order, 2)
 			return nil
 		}},

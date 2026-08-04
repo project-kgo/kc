@@ -33,9 +33,12 @@ func TestValidateConfigRejectsInvalidValues(t *testing.T) {
 			want:   ErrInvalidConfig,
 		},
 		{
-			name:   "negative mq check timeout",
-			config: Config{MQ: map[string]MQConfig{"events": {Type: MQTypeKafka, CheckTimeout: -time.Second, Kafka: &KafkaConfig{Brokers: []string{"localhost:9092"}}}}},
-			want:   ErrInvalidConfig,
+			name: "negative mq check timeout",
+			config: Config{MQ: map[string]MQConfig{"events": {
+				Type: MQTypeRedisStream, DSN: "redis://localhost:6379", CheckTimeout: -time.Second,
+				RedisStream: &RedisStreamConfig{},
+			}}},
+			want: ErrInvalidConfig,
 		},
 		{
 			name:   "missing sql dsn",
@@ -88,53 +91,6 @@ func TestValidateConfigRejectsInvalidValues(t *testing.T) {
 			want: ErrInvalidConfig,
 		},
 		{
-			name:   "missing kafka config",
-			config: Config{MQ: map[string]MQConfig{"events": {Type: MQTypeKafka}}},
-			want:   ErrInvalidConfig,
-		},
-		{
-			name:   "missing kafka broker",
-			config: Config{MQ: map[string]MQConfig{"events": {Type: MQTypeKafka, Kafka: &KafkaConfig{}}}},
-			want:   ErrInvalidConfig,
-		},
-		{
-			name: "negative kafka consumer batch size",
-			config: Config{MQ: map[string]MQConfig{"events": {
-				Type: MQTypeKafka, Kafka: &KafkaConfig{Brokers: []string{"localhost:9092"}, ConsumerBatchSize: -1},
-			}}},
-			want: ErrInvalidConfig,
-		},
-		{
-			name: "negative kafka handler timeout",
-			config: Config{MQ: map[string]MQConfig{"events": {
-				Type: MQTypeKafka, Kafka: &KafkaConfig{Brokers: []string{"localhost:9092"}, HandlerTimeout: -time.Second},
-			}}},
-			want: ErrInvalidConfig,
-		},
-		{
-			name: "kafka retry max less than base",
-			config: Config{MQ: map[string]MQConfig{"events": {
-				Type: MQTypeKafka,
-				Kafka: &KafkaConfig{
-					Brokers:         []string{"localhost:9092"},
-					RetryBackoff:    2 * time.Second,
-					RetryMaxBackoff: time.Second,
-				},
-			}}},
-			want: ErrInvalidConfig,
-		},
-		{
-			name: "unsupported kafka sasl",
-			config: Config{MQ: map[string]MQConfig{"events": {
-				Type: MQTypeKafka,
-				Kafka: &KafkaConfig{
-					Brokers: []string{"localhost:9092"},
-					SASL:    &SASLConfig{Mechanism: SASLMechanism("unknown"), Username: "user", Password: "pass"},
-				},
-			}}},
-			want: ErrInvalidConfig,
-		},
-		{
 			name: "mismatched nested data config",
 			config: Config{Data: map[string]DataConfig{"main": {
 				Type: DataTypeMySQL, DSN: "user:pass@tcp(localhost:3306)/db", Redis: &RedisConfig{},
@@ -168,7 +124,6 @@ func TestValidateConfigAcceptsDataAndMQTogether(t *testing.T) {
 			},
 		},
 		MQ: map[string]MQConfig{
-			"events": {Type: MQTypeKafka, Kafka: &KafkaConfig{Brokers: []string{"localhost:9092", "localhost:9093"}}},
 			"redis-events": {
 				Type: MQTypeRedisStream, DSN: "redis://localhost:6379/0", RedisStream: &RedisStreamConfig{},
 			},

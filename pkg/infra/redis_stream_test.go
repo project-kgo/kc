@@ -928,3 +928,24 @@ func redisStreamQueuedMessages(mq *redisStreamMQ) int {
 func redisStreamTestID(value int) string {
 	return strconv.Itoa(value) + "-0"
 }
+
+func waitForSignal(t *testing.T, signal <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(2 * time.Second):
+		t.Fatal("等待 Redis Stream 测试信号超时")
+	}
+}
+
+func waitForCondition(t *testing.T, condition func() bool, failureMessage string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal(failureMessage)
+}

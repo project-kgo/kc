@@ -25,18 +25,8 @@ const (
 type MQType string
 
 const (
-	MQTypeKafka              MQType = "kafka"
 	MQTypeRedisStream        MQType = "redis-stream"
 	MQTypeRedisStreamCluster MQType = "redis-stream-cluster"
-)
-
-// SASLMechanism 表示 Kafka 使用的 SASL 认证机制。
-type SASLMechanism string
-
-const (
-	SASLPlain       SASLMechanism = "plain"
-	SASLSCRAMSHA256 SASLMechanism = "scram-sha-256"
-	SASLSCRAMSHA512 SASLMechanism = "scram-sha-512"
 )
 
 var (
@@ -74,7 +64,6 @@ type MQConfig struct {
 	SkipCheck    bool          `json:"skip_check,omitempty" yaml:"skip_check,omitempty"`
 	CheckTimeout time.Duration `json:"check_timeout,omitempty" yaml:"check_timeout,omitempty"`
 
-	Kafka       *KafkaConfig       `json:"kafka,omitempty" yaml:"kafka,omitempty"`
 	Redis       *RedisConfig       `json:"redis,omitempty" yaml:"redis,omitempty"`
 	RedisStream *RedisStreamConfig `json:"redis_stream,omitempty" yaml:"redis_stream,omitempty"`
 }
@@ -118,23 +107,6 @@ type ElasticsearchConfig struct {
 	DiscoverNodesOnStart   bool     `json:"discover_nodes_on_start,omitempty" yaml:"discover_nodes_on_start,omitempty"`
 }
 
-// KafkaConfig 配置 Kafka broker、客户端以及认证信息。
-// 消费相关字段是订阅默认值，可由 pkg/mq 的 SubscribeOption 按订阅覆盖。
-type KafkaConfig struct {
-	Brokers     []string      `json:"brokers,omitempty" yaml:"brokers,omitempty"`
-	ClientID    string        `json:"client_id,omitempty" yaml:"client_id,omitempty"`
-	DialTimeout time.Duration `json:"dial_timeout,omitempty" yaml:"dial_timeout,omitempty"`
-	TLS         bool          `json:"tls,omitempty" yaml:"tls,omitempty"`
-	SASL        *SASLConfig   `json:"sasl,omitempty" yaml:"sasl,omitempty"`
-	// ConsumerBatchSize 控制每次 PollRecords 最多拉取的消息数，零值默认为 100。
-	ConsumerBatchSize int `json:"consumer_batch_size,omitempty" yaml:"consumer_batch_size,omitempty"`
-	// HandlerTimeout 是单条消息的处理超时，零值默认为 30 秒；Handler 需要响应 context 取消。
-	HandlerTimeout time.Duration `json:"handler_timeout,omitempty" yaml:"handler_timeout,omitempty"`
-	// RetryBackoff 和 RetryMaxBackoff 控制重建 consumer 的指数退避，零值分别为 1 秒和 30 秒。
-	RetryBackoff    time.Duration `json:"retry_backoff,omitempty" yaml:"retry_backoff,omitempty"`
-	RetryMaxBackoff time.Duration `json:"retry_max_backoff,omitempty" yaml:"retry_max_backoff,omitempty"`
-}
-
 // RedisStreamConfig 配置 Redis 7.0+ Streams 的批量消费、并发、重试和裁剪策略。
 // 消费相关字段是订阅默认值，可由 pkg/mq 的 SubscribeOption 按订阅覆盖。
 type RedisStreamConfig struct {
@@ -156,13 +128,6 @@ type RedisStreamConfig struct {
 	MaxLen int64 `json:"max_len,omitempty" yaml:"max_len,omitempty"`
 	// Logger 用于记录无法解码而被丢弃的消息；为空时使用 slog.Default()。
 	Logger *slog.Logger `json:"-" yaml:"-"`
-}
-
-// SASLConfig 配置 Kafka SASL 用户名、密码和认证机制。
-type SASLConfig struct {
-	Mechanism SASLMechanism `json:"mechanism" yaml:"mechanism"`
-	Username  string        `json:"username" yaml:"username"`
-	Password  string        `json:"password" yaml:"password"`
 }
 
 func validateConfig(config Config) error {
@@ -218,15 +183,7 @@ func validateMQConfig(config MQConfig) error {
 		return fmt.Errorf("%w: check timeout is negative", ErrInvalidConfig)
 	}
 	switch config.Type {
-	case MQTypeKafka:
-		if config.DSN != "" || config.Redis != nil || config.RedisStream != nil {
-			return fmt.Errorf("%w: unexpected redis stream config", ErrInvalidConfig)
-		}
-		return validateKafkaConfig(config)
 	case MQTypeRedisStream, MQTypeRedisStreamCluster:
-		if config.Kafka != nil {
-			return fmt.Errorf("%w: unexpected kafka config", ErrInvalidConfig)
-		}
 		return validateRedisStreamConfig(config)
 	default:
 		return fmt.Errorf("%w: mq %q", ErrUnsupportedType, config.Type)
