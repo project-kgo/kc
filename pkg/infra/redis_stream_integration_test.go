@@ -2,6 +2,7 @@ package infra
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -65,10 +66,12 @@ func testRedisStreamStoreIntegration(t *testing.T, dsn string, cluster bool) {
 		group = "billing"
 	)
 	stream := mq.streamKey(topic)
+	dlqStream := mq.streamKey(topic + redisStreamDLQSuffix)
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
 		_ = client.Del(cleanupCtx, stream).Err()
+		_ = client.Del(cleanupCtx, dlqStream).Err()
 	})
 
 	if err := store.EnsureGroup(ctx, stream, group, "0"); err != nil {
@@ -97,6 +100,10 @@ func testRedisStreamStoreIntegration(t *testing.T, dsn string, cluster bool) {
 	if err != nil || string(decoded.Key) != "key" || string(decoded.Body) != "payload" {
 		t.Fatalf("decoded message = (%#v, %v)", decoded, err)
 	}
+	pendingEntry, exists, err := store.PendingEntry(ctx, stream, group, messages[0].ID)
+	if err != nil || !exists || pendingEntry.RetryCount < 2 {
+		t.Fatalf("PendingEntry() = (%#v, %v, %v)", pendingEntry, exists, err)
+	}
 	if acknowledged, err := store.Ack(ctx, stream, group, messages[0].ID); err != nil || acknowledged != 1 {
 		t.Fatalf("Ack() = (%d, %v)", acknowledged, err)
 	}
@@ -124,5 +131,87 @@ func testRedisStreamStoreIntegration(t *testing.T, dsn string, cluster bool) {
 	summary, err = client.XPending(ctx, stream, group).Result()
 	if err != nil || summary.Count != 0 {
 		t.Fatalf("pending summary after tombstone cleanup = (%#v, %v)", summary, err)
+	}
+
+	// 批量 ACK 应一次移除多个 Pending 条目。
+	firstID, err := store.Add(ctx, stream, values, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondID, err := store.Add(ctx, stream, values, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batch, err := store.ReadGroup(ctx, stream, group, "consumer-batch", 64, time.Millisecond)
+	if err != nil || len(batch) != 2 {
+		t.Fatalf("batch ReadGroup() = (%v, %v)", batch, err)
+	}
+	if acknowledged, err := store.Ack(ctx, stream, group, firstID, secondID); err != nil || acknowledged != 2 {
+		t.Fatalf("batch Ack() = (%d, %v)", acknowledged, err)
+	}
+
+	// Lua 清理只能删除零 Pending consumer，并支持排除当前 consumer。
+	for _, consumer := range []string{"empty-consumer", "excluded-consumer"} {
+		if err := client.XGroupCreateConsumer(ctx, stream, group, consumer).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if deleted, err := store.CleanupConsumers(ctx, stream, group, "empty-consumer", "", 0, 1); err != nil || deleted != 1 {
+		t.Fatalf("cleanup current consumer = (%d, %v)", deleted, err)
+	}
+	pendingID, err := store.Add(ctx, stream, values, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if messages, err := store.ReadGroup(ctx, stream, group, "pending-consumer", 1, time.Millisecond); err != nil || len(messages) != 1 {
+		t.Fatalf("pending consumer read = (%v, %v)", messages, err)
+	}
+	if deleted, err := store.CleanupConsumers(ctx, stream, group, "pending-consumer", "", 0, 1); err != nil || deleted != 0 {
+		t.Fatalf("cleanup pending consumer = (%d, %v)", deleted, err)
+	}
+	if _, exists, err := store.PendingEntry(ctx, stream, group, pendingID); err != nil || !exists {
+		t.Fatalf("pending entry after cleanup = (%v, %v)", exists, err)
+	}
+	if _, err := store.Ack(ctx, stream, group, pendingID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CleanupConsumers(ctx, stream, group, "", "excluded-consumer", 0, 128); err != nil {
+		t.Fatal(err)
+	}
+	consumers, err := client.XInfoConsumers(ctx, stream, group).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundExcluded := false
+	for _, consumer := range consumers {
+		foundExcluded = foundExcluded || consumer.Name == "excluded-consumer"
+	}
+	if !foundExcluded {
+		t.Fatal("excluded consumer was deleted")
+	}
+
+	// 达到最大投递次数后写入自动 DLQ，再确认源消息。
+	poisonID, err := store.Add(ctx, stream, values, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poison, err := store.ReadGroup(ctx, stream, group, "poison-consumer", 1, time.Millisecond)
+	if err != nil || len(poison) != 1 || poison[0].ID != poisonID {
+		t.Fatalf("poison read = (%v, %v)", poison, err)
+	}
+	dlqConfig := config
+	dlqConfig.maxDeliveryAttempts = 1
+	mq.processRedisStreamMessage(ctx, topic, stream, group,
+		func(context.Context, *Message) error { return errors.New("poison") }, poison[0], dlqConfig)
+	dlqEntries, err := client.XRange(ctx, dlqStream, "-", "+").Result()
+	if err != nil || len(dlqEntries) != 1 {
+		t.Fatalf("DLQ entries = (%v, %v)", dlqEntries, err)
+	}
+	dlqMessage, err := messageFromRedisStreamRecord(dlqEntries[0])
+	if err != nil || string(dlqMessage.Headers[redisStreamDLQHeaderSourceMessageID]) != poisonID {
+		t.Fatalf("DLQ message = (%#v, %v)", dlqMessage, err)
+	}
+	if _, exists, err := store.PendingEntry(ctx, stream, group, poisonID); err != nil || exists {
+		t.Fatalf("source pending after DLQ = (%v, %v)", exists, err)
 	}
 }

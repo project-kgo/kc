@@ -14,6 +14,9 @@ func TestResolveSubscribeOptions(t *testing.T) {
 		WithRetryBackoff(100*time.Millisecond, 3*time.Second),
 		WithRedisStreamQueueDepth(128),
 		WithRedisStreamRedelivery(time.Minute, 10*time.Second),
+		WithRedisStreamAckBatch(64, 2*time.Millisecond),
+		WithRedisStreamReclaimMaxBatches(4),
+		WithRedisStreamMaxDeliveryAttempts(5),
 	)
 	if err != nil {
 		t.Fatalf("ResolveSubscribeOptions() error = %v", err)
@@ -26,6 +29,10 @@ func TestResolveSubscribeOptions(t *testing.T) {
 	}
 	if *options.RedisStream.QueueDepth != 128 || *options.RedisStream.PendingIdleTimeout != time.Minute || *options.RedisStream.RedeliverInterval != 10*time.Second {
 		t.Fatalf("redis stream options = %+v", options.RedisStream)
+	}
+	if *options.RedisStream.AckBatchSize != 64 || *options.RedisStream.AckFlushInterval != 2*time.Millisecond ||
+		*options.RedisStream.ReclaimMaxBatches != 4 || *options.RedisStream.MaxDeliveryAttempts != 5 {
+		t.Fatalf("redis stream reliability options = %+v", options.RedisStream)
 	}
 }
 
@@ -55,6 +62,10 @@ func TestResolveSubscribeOptionsRejectsInvalidValues(t *testing.T) {
 		{name: "pending idle", option: WithRedisStreamPendingIdleTimeout(0)},
 		{name: "redeliver interval", option: WithRedisStreamRedeliverInterval(0)},
 		{name: "redelivery", option: WithRedisStreamRedelivery(time.Second, 0)},
+		{name: "ack batch size", option: WithRedisStreamAckBatch(0, time.Millisecond)},
+		{name: "ack flush interval", option: WithRedisStreamAckBatch(1, 0)},
+		{name: "reclaim max batches", option: WithRedisStreamReclaimMaxBatches(0)},
+		{name: "max delivery attempts", option: WithRedisStreamMaxDeliveryAttempts(0)},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

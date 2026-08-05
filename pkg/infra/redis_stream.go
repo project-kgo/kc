@@ -22,43 +22,66 @@ import (
 var _ coremq.MQ = (*redisStreamMQ)(nil)
 
 const (
-	defaultRedisStreamKeyPrefix          = "kc:mq"
-	defaultRedisStreamConsumerBatchSize  = int64(64)
-	defaultRedisStreamQueueDepth         = 64
-	defaultRedisStreamConcurrency        = 10
-	defaultRedisStreamGroupStartID       = "0"
-	defaultRedisStreamReadBlock          = time.Second
-	defaultRedisStreamHandlerTimeout     = 30 * time.Second
-	defaultRedisStreamPendingIdleTimeout = time.Minute
-	defaultRedisStreamRedeliverInterval  = 15 * time.Second
-	defaultRedisStreamRetryBackoff       = time.Second
-	defaultRedisStreamRetryMaxBackoff    = 30 * time.Second
-	redisStreamMaxBatchSize              = int64(10000)
-	redisStreamMaxQueueDepth             = 10000
-	redisStreamMaxConcurrency            = 10000
-	redisStreamMessageVersion            = "1"
-	redisStreamFieldVersion              = "v"
-	redisStreamFieldKey                  = "key"
-	redisStreamFieldBody                 = "body"
-	redisStreamFieldHeaders              = "headers"
-	redisStreamFieldTimestamp            = "timestamp"
+	defaultRedisStreamKeyPrefix                  = "kc:mq"
+	defaultRedisStreamConsumerBatchSize          = int64(64)
+	defaultRedisStreamQueueDepth                 = 64
+	defaultRedisStreamConcurrency                = 10
+	defaultRedisStreamAckBatchSize               = 64
+	defaultRedisStreamAckFlushInterval           = 2 * time.Millisecond
+	defaultRedisStreamReclaimMaxBatches          = 4
+	defaultRedisStreamMaxDeliveryAttempts        = 5
+	defaultRedisStreamGroupStartID               = "0"
+	defaultRedisStreamReadBlock                  = time.Second
+	defaultRedisStreamHandlerTimeout             = 30 * time.Second
+	defaultRedisStreamPendingIdleTimeout         = time.Minute
+	defaultRedisStreamRedeliverInterval          = 15 * time.Second
+	defaultRedisStreamRetryBackoff               = time.Second
+	defaultRedisStreamRetryMaxBackoff            = 30 * time.Second
+	defaultRedisStreamConsumerCleanupInterval    = time.Hour
+	defaultRedisStreamConsumerCleanupIdleTimeout = 24 * time.Hour
+	redisStreamMaxBatchSize                      = int64(10000)
+	redisStreamMaxQueueDepth                     = 10000
+	redisStreamMaxConcurrency                    = 10000
+	redisStreamMaxAckBatchSize                   = 10000
+	redisStreamMaxReclaimBatches                 = 10000
+	redisStreamMaxDeliveryAttempts               = 10000
+	redisStreamMaxConsumerCleanupPerRun          = int64(128)
+	redisStreamMessageVersion                    = "1"
+	redisStreamFieldVersion                      = "v"
+	redisStreamFieldKey                          = "key"
+	redisStreamFieldBody                         = "body"
+	redisStreamFieldHeaders                      = "headers"
+	redisStreamFieldTimestamp                    = "timestamp"
+	redisStreamDLQSuffix                         = ".dlq"
+	redisStreamDLQHeaderSourceTopic              = "kc.dlq.source_topic"
+	redisStreamDLQHeaderSourceGroup              = "kc.dlq.source_group"
+	redisStreamDLQHeaderSourceMessageID          = "kc.dlq.source_message_id"
+	redisStreamDLQHeaderDeliveryCount            = "kc.dlq.delivery_count"
+	redisStreamDLQHeaderError                    = "kc.dlq.error"
+	redisStreamDLQHeaderFailedAt                 = "kc.dlq.failed_at"
 )
 
 type redisStreamRuntimeConfig struct {
-	keyPrefix          string
-	batchSize          int64
-	queueDepth         int
-	concurrency        int
-	consumerID         string
-	groupStartID       string
-	readBlock          time.Duration
-	handlerTimeout     time.Duration
-	pendingIdleTimeout time.Duration
-	redeliverInterval  time.Duration
-	retryBackoff       time.Duration
-	retryMaxBackoff    time.Duration
-	maxLen             int64
-	logger             *slog.Logger
+	keyPrefix                  string
+	batchSize                  int64
+	queueDepth                 int
+	concurrency                int
+	ackBatchSize               int
+	ackFlushInterval           time.Duration
+	reclaimMaxBatches          int
+	maxDeliveryAttempts        int
+	consumerID                 string
+	groupStartID               string
+	readBlock                  time.Duration
+	handlerTimeout             time.Duration
+	pendingIdleTimeout         time.Duration
+	redeliverInterval          time.Duration
+	retryBackoff               time.Duration
+	retryMaxBackoff            time.Duration
+	consumerCleanupInterval    time.Duration
+	consumerCleanupIdleTimeout time.Duration
+	maxLen                     int64
+	logger                     *slog.Logger
 }
 
 type redisStreamMQState uint8
@@ -73,10 +96,12 @@ type redisStreamSubscription struct {
 	stop context.CancelFunc
 	done chan struct{}
 
-	queue chan redis.XMessage
-	mu    sync.Mutex
+	queue    chan redis.XMessage
+	ackQueue chan string
+	mu       sync.Mutex
 	// inFlight 同时覆盖已经入队和正在执行的消息，避免 poll 与 reclaim 重复入队。
-	inFlight map[string]struct{}
+	inFlight      map[string]struct{}
+	reclaimCursor string
 }
 
 func (s *redisStreamSubscription) enqueue(ctx context.Context, message redis.XMessage) bool {
@@ -103,6 +128,27 @@ func (s *redisStreamSubscription) release(messageID string) {
 	s.mu.Unlock()
 }
 
+func (s *redisStreamSubscription) resetReclaimCursor() {
+	s.mu.Lock()
+	s.reclaimCursor = "0-0"
+	s.mu.Unlock()
+}
+
+func (s *redisStreamSubscription) getReclaimCursor() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reclaimCursor == "" {
+		return "0-0"
+	}
+	return s.reclaimCursor
+}
+
+func (s *redisStreamSubscription) setReclaimCursor(cursor string) {
+	s.mu.Lock()
+	s.reclaimCursor = cursor
+	s.mu.Unlock()
+}
+
 type redisStreamMQ struct {
 	store  redisStreamStore
 	config redisStreamRuntimeConfig
@@ -122,11 +168,45 @@ type redisStreamStore interface {
 	ReadGroup(context.Context, string, string, string, int64, time.Duration) ([]redis.XMessage, error)
 	AutoClaim(context.Context, string, string, string, time.Duration, string, int64) ([]redis.XMessage, string, error)
 	Ack(context.Context, string, string, ...string) (int64, error)
+	PendingEntry(context.Context, string, string, string) (redis.XPendingExt, bool, error)
+	CleanupConsumers(context.Context, string, string, string, string, time.Duration, int64) (int64, error)
 }
 
 type redisStreamRedisStore struct {
 	client redis.UniversalClient
 }
+
+const redisStreamCleanupConsumersScript = `
+local consumers = redis.call('XINFO', 'CONSUMERS', KEYS[1], ARGV[1])
+local target = ARGV[2]
+local exclude = ARGV[3]
+local min_idle = tonumber(ARGV[4])
+local max_delete = tonumber(ARGV[5])
+local deleted = 0
+for _, consumer in ipairs(consumers) do
+  local name = nil
+  local pending = nil
+  local idle = nil
+  for index = 1, #consumer, 2 do
+    if consumer[index] == 'name' then
+      name = consumer[index + 1]
+    elseif consumer[index] == 'pending' then
+      pending = tonumber(consumer[index + 1])
+    elseif consumer[index] == 'idle' then
+      idle = tonumber(consumer[index + 1])
+    end
+  end
+  if name ~= nil and pending == 0 and idle ~= nil and idle >= min_idle
+      and (target == '' or name == target) and (exclude == '' or name ~= exclude) then
+    redis.call('XGROUP', 'DELCONSUMER', KEYS[1], ARGV[1], name)
+    deleted = deleted + 1
+    if deleted >= max_delete then
+      break
+    end
+  end
+end
+return deleted
+`
 
 func newRedisStreamMQ(store redisStreamStore, config redisStreamRuntimeConfig) *redisStreamMQ {
 	return &redisStreamMQ{
@@ -204,10 +284,12 @@ func (m *redisStreamMQ) Subscribe(
 
 	pollCtx, stop := context.WithCancel(ctx)
 	subscription := &redisStreamSubscription{
-		stop:     stop,
-		done:     make(chan struct{}),
-		queue:    make(chan redis.XMessage, subscriptionConfig.queueDepth),
-		inFlight: make(map[string]struct{}),
+		stop:          stop,
+		done:          make(chan struct{}),
+		queue:         make(chan redis.XMessage, subscriptionConfig.queueDepth),
+		ackQueue:      make(chan string, subscriptionConfig.queueDepth),
+		inFlight:      make(map[string]struct{}),
+		reclaimCursor: "0-0",
 	}
 	if !m.trackSubscription(subscription) {
 		stop()
@@ -215,7 +297,7 @@ func (m *redisStreamMQ) Subscribe(
 	}
 
 	consumer := m.subscriptionConsumerID()
-	go m.runSubscription(pollCtx, ctx, stream, group, consumer, handler, subscriptionConfig, subscription)
+	go m.runSubscription(pollCtx, ctx, topic, stream, group, consumer, handler, subscriptionConfig, subscription)
 	return nil
 }
 
@@ -292,6 +374,7 @@ func (m *redisStreamMQ) untrackSubscription(subscription *redisStreamSubscriptio
 func (m *redisStreamMQ) runSubscription(
 	pollCtx context.Context,
 	subscriptionCtx context.Context,
+	topic string,
 	stream string,
 	group string,
 	consumer string,
@@ -304,25 +387,38 @@ func (m *redisStreamMQ) runSubscription(
 		close(subscription.done)
 	}()
 
-	var loops sync.WaitGroup
-	loops.Add(2 + config.concurrency)
+	var producers sync.WaitGroup
+	producers.Add(2)
 	go func() {
-		defer loops.Done()
+		defer producers.Done()
 		m.pollRedisStreamMessages(pollCtx, stream, group, consumer, config, subscription)
 	}()
 	go func() {
-		defer loops.Done()
+		defer producers.Done()
 		m.reclaimRedisStreamMessages(pollCtx, stream, group, consumer, config, subscription)
 	}()
+
+	var workers sync.WaitGroup
+	workers.Add(config.concurrency)
 	for range config.concurrency {
 		go func() {
-			defer loops.Done()
-			m.runRedisStreamWorker(pollCtx, subscriptionCtx, stream, group, handler, config, subscription)
+			defer workers.Done()
+			m.runRedisStreamWorker(pollCtx, subscriptionCtx, topic, stream, group, handler, config, subscription)
 		}()
 	}
 
+	ackDone := make(chan struct{})
+	go func() {
+		defer close(ackDone)
+		m.runRedisStreamAckWorker(subscriptionCtx, stream, group, config, subscription)
+	}()
+
 	<-pollCtx.Done()
-	loops.Wait()
+	producers.Wait()
+	workers.Wait()
+	close(subscription.ackQueue)
+	<-ackDone
+	m.cleanupRedisStreamConsumer(subscriptionCtx, stream, group, consumer, config)
 }
 
 func (m *redisStreamMQ) pollRedisStreamMessages(
@@ -341,8 +437,9 @@ func (m *redisStreamMQ) pollRedisStreamMessages(
 				return
 			}
 			if redisStreamNoGroup(err) {
-				err = m.store.EnsureGroup(ctx, stream, group, "0")
+				err = m.store.EnsureGroup(ctx, stream, group, config.groupStartID)
 				if err == nil {
+					subscription.resetReclaimCursor()
 					retryAttempt = 0
 					continue
 				}
@@ -377,6 +474,7 @@ func (m *redisStreamMQ) reclaimRedisStreamMessages(
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	retryAttempt := 0
+	nextCleanup := time.Now().Add(config.consumerCleanupInterval)
 
 	for {
 		select {
@@ -390,10 +488,18 @@ func (m *redisStreamMQ) reclaimRedisStreamMessages(
 			return
 		}
 		if redisStreamNoGroup(err) {
-			err = m.store.EnsureGroup(ctx, stream, group, "0")
+			err = m.store.EnsureGroup(ctx, stream, group, config.groupStartID)
+			if err == nil {
+				subscription.resetReclaimCursor()
+			}
 			if redisStreamCommandCanceled(ctx, err) {
 				return
 			}
+		}
+
+		if !time.Now().Before(nextCleanup) {
+			m.cleanupStaleRedisStreamConsumers(ctx, stream, group, consumer, config)
+			nextCleanup = time.Now().Add(config.consumerCleanupInterval)
 		}
 
 		delay := config.redeliverInterval
@@ -416,8 +522,11 @@ func (m *redisStreamMQ) reclaimRedisStreamPending(
 	config redisStreamRuntimeConfig,
 	subscription *redisStreamSubscription,
 ) error {
-	start := "0-0"
-	for ctx.Err() == nil {
+	start := subscription.getReclaimCursor()
+	for range config.reclaimMaxBatches {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		claimed, nextStart, err := m.store.AutoClaim(
 			ctx, stream, group, consumer, config.pendingIdleTimeout, start, config.batchSize,
 		)
@@ -432,19 +541,22 @@ func (m *redisStreamMQ) reclaimRedisStreamPending(
 
 		// Redis 7+ 会在 XAUTOCLAIM 扫描时自动清理载荷已裁剪的 PEL 条目。
 		if nextStart == "0-0" {
+			subscription.setReclaimCursor("0-0")
 			return nil
 		}
 		if nextStart == "" || nextStart == start {
 			return fmt.Errorf("redis stream XAUTOCLAIM returned invalid cursor %q", nextStart)
 		}
 		start = nextStart
+		subscription.setReclaimCursor(nextStart)
 	}
-	return ctx.Err()
+	return nil
 }
 
 func (m *redisStreamMQ) runRedisStreamWorker(
 	pollCtx context.Context,
 	subscriptionCtx context.Context,
+	topic string,
 	stream string,
 	group string,
 	handler coremq.Handler,
@@ -464,51 +576,40 @@ func (m *redisStreamMQ) runRedisStreamWorker(
 				subscription.release(record.ID)
 				return
 			}
-			func() {
-				defer subscription.release(record.ID)
-				m.processRedisStreamMessage(subscriptionCtx, stream, group, handler, record, config)
-			}()
+			ack := m.processRedisStreamMessage(subscriptionCtx, topic, stream, group, handler, record, config)
+			if !ack {
+				subscription.release(record.ID)
+				continue
+			}
+			// Close 只取消 pollCtx，仍允许已成功的 Handler 提交 ACK；订阅取消则不确认失效结果。
+			select {
+			case subscription.ackQueue <- record.ID:
+			case <-subscriptionCtx.Done():
+				subscription.release(record.ID)
+			}
 		}
 	}
 }
 
 func (m *redisStreamMQ) processRedisStreamMessage(
 	subscriptionCtx context.Context,
+	topic string,
 	stream string,
 	group string,
 	handler coremq.Handler,
 	record redis.XMessage,
 	config redisStreamRuntimeConfig,
-) {
+) bool {
 	message, err := messageFromRedisStreamRecord(record)
 	if err != nil {
-		logger := config.logger
-		if logger == nil {
-			logger = slog.Default()
-		}
-		logCtx := context.WithoutCancel(subscriptionCtx)
-		logger.ErrorContext(logCtx, "丢弃无法解码的 Redis Stream 消息",
-			"stream", stream,
-			"group", group,
-			"message_id", record.ID,
-			"error", err,
-		)
-		if ackErr := m.ackRedisStreamMessage(subscriptionCtx, stream, group, record.ID, config.retryMaxBackoff); ackErr != nil {
-			// ACK 失败时消息仍保留在 PEL，后续会再次领取并重试丢弃。
-			logger.ErrorContext(logCtx, "确认无法解码的 Redis Stream 消息失败",
-				"stream", stream,
-				"group", group,
-				"message_id", record.ID,
-				"error", ackErr,
-			)
-		}
-		return
+		m.deadLetterInvalidRedisStreamRecord(subscriptionCtx, topic, stream, group, record, err, config)
+		return false
 	}
-	if err := m.handleRedisStreamMessage(subscriptionCtx, handler, message, config.handlerTimeout); err != nil {
-		return
+	if handlerErr := m.handleRedisStreamMessage(subscriptionCtx, handler, message, config.handlerTimeout); handlerErr != nil {
+		m.handleFailedRedisStreamMessage(subscriptionCtx, topic, stream, group, record.ID, message, handlerErr, config)
+		return false
 	}
-
-	_ = m.ackRedisStreamMessage(subscriptionCtx, stream, group, record.ID, config.retryMaxBackoff)
+	return true
 }
 
 func (m *redisStreamMQ) ackRedisStreamMessage(
@@ -523,6 +624,236 @@ func (m *redisStreamMQ) ackRedisStreamMessage(
 	defer cancel()
 	_, err := m.store.Ack(ackCtx, stream, group, messageID)
 	return err
+}
+
+func (m *redisStreamMQ) runRedisStreamAckWorker(
+	parent context.Context,
+	stream string,
+	group string,
+	config redisStreamRuntimeConfig,
+	subscription *redisStreamSubscription,
+) {
+	ids := make([]string, 0, config.ackBatchSize)
+	timer := time.NewTimer(config.ackFlushInterval)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+
+	flush := func() {
+		if len(ids) == 0 {
+			return
+		}
+		batch := append([]string(nil), ids...)
+		ids = ids[:0]
+		ackCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), config.retryMaxBackoff)
+		_, err := m.store.Ack(ackCtx, stream, group, batch...)
+		cancel()
+		if err != nil {
+			redisStreamLogger(config).ErrorContext(context.WithoutCancel(parent), "批量确认 Redis Stream 消息失败",
+				"stream", stream, "group", group, "count", len(batch), "error", err)
+		}
+		for _, id := range batch {
+			subscription.release(id)
+		}
+	}
+
+	for {
+		var timerC <-chan time.Time
+		if len(ids) > 0 {
+			timerC = timer.C
+		}
+		select {
+		case id, ok := <-subscription.ackQueue:
+			if !ok {
+				flush()
+				return
+			}
+			ids = append(ids, id)
+			if len(ids) == 1 {
+				timer.Reset(config.ackFlushInterval)
+			}
+			if len(ids) >= config.ackBatchSize {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				flush()
+			}
+		case <-timerC:
+			flush()
+		}
+	}
+}
+
+func (m *redisStreamMQ) handleFailedRedisStreamMessage(
+	parent context.Context,
+	topic string,
+	stream string,
+	group string,
+	messageID string,
+	message *coremq.Message,
+	handlerErr error,
+	config redisStreamRuntimeConfig,
+) {
+	logger := redisStreamLogger(config)
+	logCtx := context.WithoutCancel(parent)
+	pending, exists, err := m.store.PendingEntry(parent, stream, group, messageID)
+	if err != nil {
+		logger.ErrorContext(logCtx, "查询 Redis Stream 消息投递次数失败",
+			"stream", stream, "group", group, "message_id", messageID, "error", err)
+		return
+	}
+	if !exists {
+		logger.WarnContext(logCtx, "失败的 Redis Stream 消息已不在 Pending 列表",
+			"stream", stream, "group", group, "message_id", messageID)
+		return
+	}
+	logger.WarnContext(logCtx, "处理 Redis Stream 消息失败",
+		"stream", stream, "group", group, "message_id", messageID,
+		"delivery_count", pending.RetryCount, "error", handlerErr)
+	if pending.RetryCount < int64(config.maxDeliveryAttempts) {
+		return
+	}
+	m.moveRedisStreamMessageToDLQ(parent, topic, stream, group, messageID, message, pending.RetryCount, handlerErr, config)
+}
+
+func (m *redisStreamMQ) deadLetterInvalidRedisStreamRecord(
+	parent context.Context,
+	topic string,
+	stream string,
+	group string,
+	record redis.XMessage,
+	decodeErr error,
+	config redisStreamRuntimeConfig,
+) {
+	logger := redisStreamLogger(config)
+	logCtx := context.WithoutCancel(parent)
+	pending, exists, err := m.store.PendingEntry(parent, stream, group, record.ID)
+	if err != nil {
+		logger.ErrorContext(logCtx, "查询无法解码消息的投递次数失败",
+			"stream", stream, "group", group, "message_id", record.ID, "error", err)
+		return
+	}
+	if !exists {
+		logger.WarnContext(logCtx, "无法解码的消息已不在 Pending 列表",
+			"stream", stream, "group", group, "message_id", record.ID)
+		return
+	}
+	body, err := json.Marshal(record.Values)
+	if err != nil {
+		logger.ErrorContext(logCtx, "序列化无法解码的 Redis Stream 原始字段失败",
+			"stream", stream, "group", group, "message_id", record.ID, "error", err)
+		return
+	}
+	message := &coremq.Message{Body: body, Timestamp: redisStreamTimestampFromID(record.ID)}
+	m.moveRedisStreamMessageToDLQ(parent, topic, stream, group, record.ID, message, pending.RetryCount, decodeErr, config)
+}
+
+func (m *redisStreamMQ) moveRedisStreamMessageToDLQ(
+	parent context.Context,
+	topic string,
+	stream string,
+	group string,
+	messageID string,
+	message *coremq.Message,
+	deliveryCount int64,
+	reason error,
+	config redisStreamRuntimeConfig,
+) {
+	dlqMessage := cloneRedisStreamMessage(message)
+	if dlqMessage.Headers == nil {
+		dlqMessage.Headers = make(map[string][]byte, 6)
+	}
+	dlqMessage.Headers[redisStreamDLQHeaderSourceTopic] = []byte(topic)
+	dlqMessage.Headers[redisStreamDLQHeaderSourceGroup] = []byte(group)
+	dlqMessage.Headers[redisStreamDLQHeaderSourceMessageID] = []byte(messageID)
+	dlqMessage.Headers[redisStreamDLQHeaderDeliveryCount] = []byte(strconv.FormatInt(deliveryCount, 10))
+	dlqMessage.Headers[redisStreamDLQHeaderError] = []byte(reason.Error())
+	dlqMessage.Headers[redisStreamDLQHeaderFailedAt] = []byte(time.Now().UTC().Format(time.RFC3339Nano))
+
+	values, err := marshalRedisStreamMessage(dlqMessage)
+	if err == nil {
+		_, err = m.store.Add(parent, m.streamKey(topic+redisStreamDLQSuffix), values, config.maxLen)
+	}
+	logger := redisStreamLogger(config)
+	logCtx := context.WithoutCancel(parent)
+	if err != nil {
+		logger.ErrorContext(logCtx, "写入 Redis Stream DLQ 失败",
+			"stream", stream, "group", group, "message_id", messageID, "error", err)
+		return
+	}
+	if err := m.ackRedisStreamMessage(parent, stream, group, messageID, config.retryMaxBackoff); err != nil {
+		logger.ErrorContext(logCtx, "Redis Stream 消息进入 DLQ 后确认源消息失败",
+			"stream", stream, "group", group, "message_id", messageID, "error", err)
+		return
+	}
+	logger.WarnContext(logCtx, "Redis Stream 消息已进入 DLQ",
+		"stream", stream, "group", group, "message_id", messageID,
+		"delivery_count", deliveryCount, "dlq_topic", topic+redisStreamDLQSuffix)
+}
+
+func (m *redisStreamMQ) cleanupRedisStreamConsumer(
+	parent context.Context,
+	stream string,
+	group string,
+	consumer string,
+	config redisStreamRuntimeConfig,
+) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), config.retryMaxBackoff)
+	defer cancel()
+	_, err := m.store.CleanupConsumers(ctx, stream, group, consumer, "", 0, 1)
+	if err != nil && !redisStreamNoGroup(err) {
+		redisStreamLogger(config).ErrorContext(context.WithoutCancel(parent), "清理当前 Redis Stream consumer 失败",
+			"stream", stream, "group", group, "consumer", consumer, "error", err)
+	}
+}
+
+func (m *redisStreamMQ) cleanupStaleRedisStreamConsumers(
+	ctx context.Context,
+	stream string,
+	group string,
+	consumer string,
+	config redisStreamRuntimeConfig,
+) {
+	_, err := m.store.CleanupConsumers(
+		ctx, stream, group, "", consumer, config.consumerCleanupIdleTimeout, redisStreamMaxConsumerCleanupPerRun,
+	)
+	if err != nil && !redisStreamNoGroup(err) && !redisStreamCommandCanceled(ctx, err) {
+		redisStreamLogger(config).ErrorContext(context.WithoutCancel(ctx), "清理遗留 Redis Stream consumer 失败",
+			"stream", stream, "group", group, "consumer", consumer, "error", err)
+	}
+}
+
+func redisStreamLogger(config redisStreamRuntimeConfig) *slog.Logger {
+	if config.logger != nil {
+		return config.logger
+	}
+	return slog.Default()
+}
+
+func cloneRedisStreamMessage(message *coremq.Message) *coremq.Message {
+	cloned := &coremq.Message{
+		ID: message.ID, Key: cloneRedisStreamBytes(message.Key), Body: cloneRedisStreamBytes(message.Body), Timestamp: message.Timestamp,
+	}
+	if message.Headers != nil {
+		cloned.Headers = make(map[string][]byte, len(message.Headers))
+		for key, value := range message.Headers {
+			cloned.Headers[key] = cloneRedisStreamBytes(value)
+		}
+	}
+	return cloned
+}
+
+func redisStreamTimestampFromID(messageID string) time.Time {
+	if split := strings.SplitN(messageID, "-", 2); len(split) == 2 {
+		if milliseconds, err := strconv.ParseInt(split[0], 10, 64); err == nil {
+			return time.UnixMilli(milliseconds)
+		}
+	}
+	return time.Time{}
 }
 
 func (m *redisStreamMQ) handleRedisStreamMessage(
@@ -584,6 +915,18 @@ func (m *redisStreamMQ) subscriptionConfig(options ...coremq.SubscribeOption) (r
 		if resolved.RedisStream.RedeliverInterval != nil {
 			config.redeliverInterval = *resolved.RedisStream.RedeliverInterval
 		}
+		if resolved.RedisStream.AckBatchSize != nil {
+			config.ackBatchSize = *resolved.RedisStream.AckBatchSize
+		}
+		if resolved.RedisStream.AckFlushInterval != nil {
+			config.ackFlushInterval = *resolved.RedisStream.AckFlushInterval
+		}
+		if resolved.RedisStream.ReclaimMaxBatches != nil {
+			config.reclaimMaxBatches = *resolved.RedisStream.ReclaimMaxBatches
+		}
+		if resolved.RedisStream.MaxDeliveryAttempts != nil {
+			config.maxDeliveryAttempts = *resolved.RedisStream.MaxDeliveryAttempts
+		}
 	}
 
 	if config.batchSize > redisStreamMaxBatchSize {
@@ -599,6 +942,21 @@ func (m *redisStreamMQ) subscriptionConfig(options ...coremq.SubscribeOption) (r
 	if config.concurrency > redisStreamMaxConcurrency {
 		return redisStreamRuntimeConfig{}, fmt.Errorf(
 			"%w: redis stream concurrency exceeds %d", coremq.ErrInvalidSubscribeOption, redisStreamMaxConcurrency,
+		)
+	}
+	if config.ackBatchSize > redisStreamMaxAckBatchSize {
+		return redisStreamRuntimeConfig{}, fmt.Errorf(
+			"%w: redis stream ack batch size exceeds %d", coremq.ErrInvalidSubscribeOption, redisStreamMaxAckBatchSize,
+		)
+	}
+	if config.reclaimMaxBatches > redisStreamMaxReclaimBatches {
+		return redisStreamRuntimeConfig{}, fmt.Errorf(
+			"%w: redis stream reclaim max batches exceeds %d", coremq.ErrInvalidSubscribeOption, redisStreamMaxReclaimBatches,
+		)
+	}
+	if config.maxDeliveryAttempts > redisStreamMaxDeliveryAttempts {
+		return redisStreamRuntimeConfig{}, fmt.Errorf(
+			"%w: redis stream max delivery attempts exceeds %d", coremq.ErrInvalidSubscribeOption, redisStreamMaxDeliveryAttempts,
 		)
 	}
 	if config.pendingIdleTimeout < config.handlerTimeout {
@@ -837,6 +1195,38 @@ func (s *redisStreamRedisStore) Ack(ctx context.Context, stream, group string, i
 	return s.client.XAck(ctx, stream, group, ids...).Result()
 }
 
+func (s *redisStreamRedisStore) PendingEntry(
+	ctx context.Context,
+	stream string,
+	group string,
+	messageID string,
+) (redis.XPendingExt, bool, error) {
+	entries, err := s.client.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: stream, Group: group, Start: messageID, End: messageID, Count: 1,
+	}).Result()
+	if err != nil {
+		return redis.XPendingExt{}, false, err
+	}
+	if len(entries) == 0 || entries[0].ID != messageID {
+		return redis.XPendingExt{}, false, nil
+	}
+	return entries[0], true, nil
+}
+
+func (s *redisStreamRedisStore) CleanupConsumers(
+	ctx context.Context,
+	stream string,
+	group string,
+	target string,
+	exclude string,
+	minIdle time.Duration,
+	limit int64,
+) (int64, error) {
+	return s.client.Eval(ctx, redisStreamCleanupConsumersScript, []string{stream},
+		group, target, exclude, minIdle.Milliseconds(), limit,
+	).Int64()
+}
+
 func validateRedisStreamConfig(config MQConfig) error {
 	if config.RedisStream == nil {
 		return fmt.Errorf("%w: redis stream config is missing", ErrInvalidConfig)
@@ -851,10 +1241,20 @@ func validateRedisStreamConfig(config MQConfig) error {
 	if streamConfig.Concurrency < 0 || streamConfig.Concurrency > redisStreamMaxConcurrency {
 		return fmt.Errorf("%w: redis stream concurrency must be between 1 and %d", ErrInvalidConfig, redisStreamMaxConcurrency)
 	}
+	if streamConfig.AckBatchSize < 0 || streamConfig.AckBatchSize > redisStreamMaxAckBatchSize {
+		return fmt.Errorf("%w: redis stream ack batch size must be between 1 and %d", ErrInvalidConfig, redisStreamMaxAckBatchSize)
+	}
+	if streamConfig.ReclaimMaxBatches < 0 || streamConfig.ReclaimMaxBatches > redisStreamMaxReclaimBatches {
+		return fmt.Errorf("%w: redis stream reclaim max batches must be between 1 and %d", ErrInvalidConfig, redisStreamMaxReclaimBatches)
+	}
+	if streamConfig.MaxDeliveryAttempts < 0 || streamConfig.MaxDeliveryAttempts > redisStreamMaxDeliveryAttempts {
+		return fmt.Errorf("%w: redis stream max delivery attempts must be between 1 and %d", ErrInvalidConfig, redisStreamMaxDeliveryAttempts)
+	}
 	if streamConfig.MaxLen < 0 {
 		return fmt.Errorf("%w: redis stream max len is negative", ErrInvalidConfig)
 	}
-	if streamConfig.ReadBlock < 0 || streamConfig.HandlerTimeout < 0 || streamConfig.PendingIdleTimeout < 0 || streamConfig.RedeliverInterval < 0 {
+	if streamConfig.ReadBlock < 0 || streamConfig.HandlerTimeout < 0 || streamConfig.PendingIdleTimeout < 0 || streamConfig.RedeliverInterval < 0 ||
+		streamConfig.AckFlushInterval < 0 || streamConfig.ConsumerCleanupInterval < 0 || streamConfig.ConsumerCleanupIdleTimeout < 0 {
 		return fmt.Errorf("%w: redis stream timeout is negative", ErrInvalidConfig)
 	}
 	if streamConfig.RetryBackoff < 0 || streamConfig.RetryMaxBackoff < 0 {
@@ -921,20 +1321,26 @@ func validRedisStreamStartID(value string) bool {
 
 func redisStreamRuntimeConfigFrom(config *RedisStreamConfig) redisStreamRuntimeConfig {
 	runtimeConfig := redisStreamRuntimeConfig{
-		keyPrefix:          config.KeyPrefix,
-		batchSize:          config.ConsumerBatchSize,
-		queueDepth:         config.QueueDepth,
-		concurrency:        config.Concurrency,
-		consumerID:         config.ConsumerID,
-		groupStartID:       config.GroupStartID,
-		readBlock:          config.ReadBlock,
-		handlerTimeout:     config.HandlerTimeout,
-		pendingIdleTimeout: config.PendingIdleTimeout,
-		redeliverInterval:  config.RedeliverInterval,
-		retryBackoff:       config.RetryBackoff,
-		retryMaxBackoff:    config.RetryMaxBackoff,
-		maxLen:             config.MaxLen,
-		logger:             config.Logger,
+		keyPrefix:                  config.KeyPrefix,
+		batchSize:                  config.ConsumerBatchSize,
+		queueDepth:                 config.QueueDepth,
+		concurrency:                config.Concurrency,
+		ackBatchSize:               config.AckBatchSize,
+		ackFlushInterval:           config.AckFlushInterval,
+		reclaimMaxBatches:          config.ReclaimMaxBatches,
+		maxDeliveryAttempts:        config.MaxDeliveryAttempts,
+		consumerID:                 config.ConsumerID,
+		groupStartID:               config.GroupStartID,
+		readBlock:                  config.ReadBlock,
+		handlerTimeout:             config.HandlerTimeout,
+		pendingIdleTimeout:         config.PendingIdleTimeout,
+		redeliverInterval:          config.RedeliverInterval,
+		retryBackoff:               config.RetryBackoff,
+		retryMaxBackoff:            config.RetryMaxBackoff,
+		consumerCleanupInterval:    config.ConsumerCleanupInterval,
+		consumerCleanupIdleTimeout: config.ConsumerCleanupIdleTimeout,
+		maxLen:                     config.MaxLen,
+		logger:                     config.Logger,
 	}
 	if runtimeConfig.keyPrefix == "" {
 		runtimeConfig.keyPrefix = defaultRedisStreamKeyPrefix
@@ -947,6 +1353,18 @@ func redisStreamRuntimeConfigFrom(config *RedisStreamConfig) redisStreamRuntimeC
 	}
 	if runtimeConfig.concurrency == 0 {
 		runtimeConfig.concurrency = defaultRedisStreamConcurrency
+	}
+	if runtimeConfig.ackBatchSize == 0 {
+		runtimeConfig.ackBatchSize = defaultRedisStreamAckBatchSize
+	}
+	if runtimeConfig.ackFlushInterval == 0 {
+		runtimeConfig.ackFlushInterval = defaultRedisStreamAckFlushInterval
+	}
+	if runtimeConfig.reclaimMaxBatches == 0 {
+		runtimeConfig.reclaimMaxBatches = defaultRedisStreamReclaimMaxBatches
+	}
+	if runtimeConfig.maxDeliveryAttempts == 0 {
+		runtimeConfig.maxDeliveryAttempts = defaultRedisStreamMaxDeliveryAttempts
 	}
 	if runtimeConfig.groupStartID == "" {
 		runtimeConfig.groupStartID = defaultRedisStreamGroupStartID
@@ -968,6 +1386,12 @@ func redisStreamRuntimeConfigFrom(config *RedisStreamConfig) redisStreamRuntimeC
 	}
 	if runtimeConfig.retryMaxBackoff == 0 {
 		runtimeConfig.retryMaxBackoff = defaultRedisStreamRetryMaxBackoff
+	}
+	if runtimeConfig.consumerCleanupInterval == 0 {
+		runtimeConfig.consumerCleanupInterval = defaultRedisStreamConsumerCleanupInterval
+	}
+	if runtimeConfig.consumerCleanupIdleTimeout == 0 {
+		runtimeConfig.consumerCleanupIdleTimeout = defaultRedisStreamConsumerCleanupIdleTimeout
 	}
 	if runtimeConfig.logger == nil {
 		runtimeConfig.logger = slog.Default()

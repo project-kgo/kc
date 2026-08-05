@@ -21,9 +21,13 @@ type RetryBackoff struct {
 
 // RedisStreamSubscribeOptions 包含仅适用于 Redis Streams 的订阅参数。
 type RedisStreamSubscribeOptions struct {
-	QueueDepth         *int
-	PendingIdleTimeout *time.Duration
-	RedeliverInterval  *time.Duration
+	QueueDepth          *int
+	PendingIdleTimeout  *time.Duration
+	RedeliverInterval   *time.Duration
+	AckBatchSize        *int
+	AckFlushInterval    *time.Duration
+	ReclaimMaxBatches   *int
+	MaxDeliveryAttempts *int
 }
 
 // SubscribeOptions 是 SubscribeOption 解析后的覆盖配置。
@@ -154,6 +158,41 @@ func WithRedisStreamRedelivery(pendingIdleTimeout, interval time.Duration) Subsc
 		redis := redisOptions(options)
 		redis.PendingIdleTimeout = durationPointer(pendingIdleTimeout)
 		redis.RedeliverInterval = durationPointer(interval)
+		return nil
+	})
+}
+
+// WithRedisStreamAckBatch 覆盖 Redis Streams 异步 ACK 的批量大小和刷新间隔。
+func WithRedisStreamAckBatch(size int, flushInterval time.Duration) SubscribeOption {
+	return subscribeOptionFunc(func(options *SubscribeOptions) error {
+		if size <= 0 || flushInterval <= 0 {
+			return fmt.Errorf("%w: redis stream ack batch values must be positive", ErrInvalidSubscribeOption)
+		}
+		redis := redisOptions(options)
+		redis.AckBatchSize = intPointer(size)
+		redis.AckFlushInterval = durationPointer(flushInterval)
+		return nil
+	})
+}
+
+// WithRedisStreamReclaimMaxBatches 覆盖 Redis Streams 单轮最多执行的 XAUTOCLAIM 次数。
+func WithRedisStreamReclaimMaxBatches(limit int) SubscribeOption {
+	return subscribeOptionFunc(func(options *SubscribeOptions) error {
+		if limit <= 0 {
+			return fmt.Errorf("%w: redis stream reclaim max batches must be positive", ErrInvalidSubscribeOption)
+		}
+		redisOptions(options).ReclaimMaxBatches = intPointer(limit)
+		return nil
+	})
+}
+
+// WithRedisStreamMaxDeliveryAttempts 覆盖消息进入自动 DLQ 前的最大投递次数。
+func WithRedisStreamMaxDeliveryAttempts(attempts int) SubscribeOption {
+	return subscribeOptionFunc(func(options *SubscribeOptions) error {
+		if attempts <= 0 {
+			return fmt.Errorf("%w: redis stream max delivery attempts must be positive", ErrInvalidSubscribeOption)
+		}
+		redisOptions(options).MaxDeliveryAttempts = intPointer(attempts)
 		return nil
 	})
 }

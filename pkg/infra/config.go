@@ -115,6 +115,13 @@ type RedisStreamConfig struct {
 	ConsumerBatchSize int64 `json:"consumer_batch_size,omitempty" yaml:"consumer_batch_size,omitempty"`
 	QueueDepth        int   `json:"queue_depth,omitempty" yaml:"queue_depth,omitempty"`
 	Concurrency       int   `json:"concurrency,omitempty" yaml:"concurrency,omitempty"`
+	// ACK 使用有界异步队列，达到批量大小或刷新间隔时提交。
+	AckBatchSize     int           `json:"ack_batch_size,omitempty" yaml:"ack_batch_size,omitempty"`
+	AckFlushInterval time.Duration `json:"ack_flush_interval,omitempty" yaml:"ack_flush_interval,omitempty"`
+	// ReclaimMaxBatches 限制单轮 XAUTOCLAIM 调用次数，游标会在多轮之间延续。
+	ReclaimMaxBatches int `json:"reclaim_max_batches,omitempty" yaml:"reclaim_max_batches,omitempty"`
+	// MaxDeliveryAttempts 包含首次投递；达到上限后消息会进入 <topic>.dlq。
+	MaxDeliveryAttempts int `json:"max_delivery_attempts,omitempty" yaml:"max_delivery_attempts,omitempty"`
 	// ConsumerID 是 Redis consumer 名称的可选前缀，运行时总会追加唯一随机后缀。
 	ConsumerID         string        `json:"consumer_id,omitempty" yaml:"consumer_id,omitempty"`
 	GroupStartID       string        `json:"group_start_id,omitempty" yaml:"group_start_id,omitempty"`
@@ -124,9 +131,12 @@ type RedisStreamConfig struct {
 	RedeliverInterval  time.Duration `json:"redeliver_interval,omitempty" yaml:"redeliver_interval,omitempty"`
 	RetryBackoff       time.Duration `json:"retry_backoff,omitempty" yaml:"retry_backoff,omitempty"`
 	RetryMaxBackoff    time.Duration `json:"retry_max_backoff,omitempty" yaml:"retry_max_backoff,omitempty"`
+	// ConsumerCleanupInterval 和 ConsumerCleanupIdleTimeout 控制零 Pending 遗留 consumer 的安全清理。
+	ConsumerCleanupInterval    time.Duration `json:"consumer_cleanup_interval,omitempty" yaml:"consumer_cleanup_interval,omitempty"`
+	ConsumerCleanupIdleTimeout time.Duration `json:"consumer_cleanup_idle_timeout,omitempty" yaml:"consumer_cleanup_idle_timeout,omitempty"`
 	// MaxLen 使用近似 MAXLEN 裁剪 Stream；正值会将至少一次保证限制在消息保留窗口内。
 	MaxLen int64 `json:"max_len,omitempty" yaml:"max_len,omitempty"`
-	// Logger 用于记录无法解码而被丢弃的消息；为空时使用 slog.Default()。
+	// Logger 用于记录处理、重投、DLQ 与清理异常；为空时使用 slog.Default()。
 	Logger *slog.Logger `json:"-" yaml:"-"`
 }
 

@@ -25,10 +25,11 @@ type fakeRedisStreamAdd struct {
 type fakeRedisStreamStore struct {
 	mu sync.Mutex
 
-	adds        []fakeRedisStreamAdd
-	acks        [][]string
-	ensureStart []string
-	closeCalls  int
+	adds         []fakeRedisStreamAdd
+	acks         [][]string
+	ensureStart  []string
+	closeCalls   int
+	cleanupCalls []fakeRedisStreamCleanup
 
 	closeFunc     func() error
 	addFunc       func(context.Context, string, []interface{}, int64) (string, error)
@@ -36,6 +37,17 @@ type fakeRedisStreamStore struct {
 	readFunc      func(context.Context, string, string, string, int64, time.Duration) ([]redis.XMessage, error)
 	autoClaimFunc func(context.Context, string, string, string, time.Duration, string, int64) ([]redis.XMessage, string, error)
 	ackFunc       func(context.Context, string, string, ...string) (int64, error)
+	pendingFunc   func(context.Context, string, string, string) (redis.XPendingExt, bool, error)
+	cleanupFunc   func(context.Context, string, string, string, string, time.Duration, int64) (int64, error)
+}
+
+type fakeRedisStreamCleanup struct {
+	stream  string
+	group   string
+	target  string
+	exclude string
+	minIdle time.Duration
+	limit   int64
 }
 
 func (s *fakeRedisStreamStore) Close() error {
@@ -119,6 +131,39 @@ func (s *fakeRedisStreamStore) Ack(ctx context.Context, stream, group string, id
 	return int64(len(ids)), nil
 }
 
+func (s *fakeRedisStreamStore) PendingEntry(
+	ctx context.Context,
+	stream string,
+	group string,
+	messageID string,
+) (redis.XPendingExt, bool, error) {
+	if s.pendingFunc != nil {
+		return s.pendingFunc(ctx, stream, group, messageID)
+	}
+	return redis.XPendingExt{ID: messageID, RetryCount: 1}, true, nil
+}
+
+func (s *fakeRedisStreamStore) CleanupConsumers(
+	ctx context.Context,
+	stream string,
+	group string,
+	target string,
+	exclude string,
+	minIdle time.Duration,
+	limit int64,
+) (int64, error) {
+	s.mu.Lock()
+	s.cleanupCalls = append(s.cleanupCalls, fakeRedisStreamCleanup{
+		stream: stream, group: group, target: target, exclude: exclude, minIdle: minIdle, limit: limit,
+	})
+	fn := s.cleanupFunc
+	s.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, stream, group, target, exclude, minIdle, limit)
+	}
+	return 0, nil
+}
+
 func (s *fakeRedisStreamStore) ackedIDs() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -127,6 +172,16 @@ func (s *fakeRedisStreamStore) ackedIDs() []string {
 		ids = append(ids, call...)
 	}
 	return ids
+}
+
+func (s *fakeRedisStreamStore) capturedAckCalls() [][]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	calls := make([][]string, len(s.acks))
+	for index, ids := range s.acks {
+		calls[index] = append([]string(nil), ids...)
+	}
+	return calls
 }
 
 func (s *fakeRedisStreamStore) capturedAdds() []fakeRedisStreamAdd {
@@ -147,20 +202,33 @@ func (s *fakeRedisStreamStore) capturedCloseCalls() int {
 	return s.closeCalls
 }
 
+func (s *fakeRedisStreamStore) capturedCleanupCalls() []fakeRedisStreamCleanup {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]fakeRedisStreamCleanup(nil), s.cleanupCalls...)
+}
+
 func testRedisStreamRuntimeConfig() redisStreamRuntimeConfig {
 	return redisStreamRuntimeConfig{
-		keyPrefix:          "test:mq",
-		batchSize:          64,
-		queueDepth:         64,
-		concurrency:        10,
-		consumerID:         "test-consumer",
-		groupStartID:       "0",
-		readBlock:          5 * time.Millisecond,
-		handlerTimeout:     100 * time.Millisecond,
-		pendingIdleTimeout: 100 * time.Millisecond,
-		redeliverInterval:  10 * time.Millisecond,
-		retryBackoff:       time.Millisecond,
-		retryMaxBackoff:    20 * time.Millisecond,
+		keyPrefix:                  "test:mq",
+		batchSize:                  64,
+		queueDepth:                 64,
+		concurrency:                10,
+		ackBatchSize:               64,
+		ackFlushInterval:           2 * time.Millisecond,
+		reclaimMaxBatches:          4,
+		maxDeliveryAttempts:        5,
+		consumerID:                 "test-consumer",
+		groupStartID:               "0",
+		readBlock:                  5 * time.Millisecond,
+		handlerTimeout:             100 * time.Millisecond,
+		pendingIdleTimeout:         100 * time.Millisecond,
+		redeliverInterval:          10 * time.Millisecond,
+		retryBackoff:               time.Millisecond,
+		retryMaxBackoff:            20 * time.Millisecond,
+		consumerCleanupInterval:    time.Hour,
+		consumerCleanupIdleTimeout: 24 * time.Hour,
+		logger:                     slog.Default(),
 	}
 }
 
@@ -170,6 +238,14 @@ func testRedisStreamRecord(t *testing.T, id string, message *Message) redis.XMes
 	if err != nil {
 		t.Fatal(err)
 	}
+	valueMap := make(map[string]interface{}, len(values)/2)
+	for index := 0; index < len(values); index += 2 {
+		valueMap[values[index].(string)] = values[index+1]
+	}
+	return redis.XMessage{ID: id, Values: valueMap}
+}
+
+func redisStreamRecordFromValues(id string, values []interface{}) redis.XMessage {
 	valueMap := make(map[string]interface{}, len(values)/2)
 	for index := 0; index < len(values); index += 2 {
 		valueMap[values[index].(string)] = values[index+1]
@@ -301,6 +377,9 @@ func TestRedisStreamSubscriptionOptionsOverrideDefaults(t *testing.T) {
 		WithRetryBackoff(25*time.Millisecond, 2*time.Second),
 		WithRedisStreamQueueDepth(96),
 		WithRedisStreamRedelivery(3*time.Second, 250*time.Millisecond),
+		WithRedisStreamAckBatch(48, 3*time.Millisecond),
+		WithRedisStreamReclaimMaxBatches(7),
+		WithRedisStreamMaxDeliveryAttempts(9),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -313,6 +392,10 @@ func TestRedisStreamSubscriptionOptionsOverrideDefaults(t *testing.T) {
 	}
 	if config.retryBackoff != 25*time.Millisecond || config.retryMaxBackoff != 2*time.Second {
 		t.Fatalf("subscription retry = %v/%v", config.retryBackoff, config.retryMaxBackoff)
+	}
+	if config.ackBatchSize != 48 || config.ackFlushInterval != 3*time.Millisecond ||
+		config.reclaimMaxBatches != 7 || config.maxDeliveryAttempts != 9 {
+		t.Fatalf("subscription reliability = %#v", config)
 	}
 }
 
@@ -364,7 +447,7 @@ func TestRedisStreamFailureModesDoNotAck(t *testing.T) {
 			config := testRedisStreamRuntimeConfig()
 			config.handlerTimeout = 5 * time.Millisecond
 			mq := newRedisStreamMQ(store, config)
-			mq.processRedisStreamMessage(context.Background(), "stream", "group", test.handler, test.record(t), config)
+			mq.processRedisStreamMessage(context.Background(), "topic", "stream", "group", test.handler, test.record(t), config)
 			if ids := store.ackedIDs(); len(ids) != 0 {
 				t.Fatalf("acked IDs = %v", ids)
 			}
@@ -372,15 +455,89 @@ func TestRedisStreamFailureModesDoNotAck(t *testing.T) {
 	}
 }
 
-func TestRedisStreamDecodeFailureLogsAndAcknowledges(t *testing.T) {
+func TestRedisStreamMaxDeliveryAttemptsMovesMessageToDLQ(t *testing.T) {
+	handlerErr := errors.New("poison message")
+	original := &Message{
+		Key: []byte("order-1"), Body: []byte("payload"),
+		Headers: map[string][]byte{"trace": []byte("abc")}, Timestamp: time.Unix(123, 456),
+	}
+	record := testRedisStreamRecord(t, "1000-1", original)
+
+	t.Run("below limit remains pending", func(t *testing.T) {
+		store := &fakeRedisStreamStore{}
+		store.pendingFunc = func(context.Context, string, string, string) (redis.XPendingExt, bool, error) {
+			return redis.XPendingExt{ID: record.ID, RetryCount: 4}, true, nil
+		}
+		config := testRedisStreamRuntimeConfig()
+		mq := newRedisStreamMQ(store, config)
+		if ack := mq.processRedisStreamMessage(context.Background(), "orders", "stream", "billing",
+			func(context.Context, *Message) error { return handlerErr }, record, config); ack {
+			t.Fatal("failed message unexpectedly requested batch ACK")
+		}
+		if len(store.capturedAdds()) != 0 || len(store.ackedIDs()) != 0 {
+			t.Fatalf("below-limit adds/acks = %v/%v", store.capturedAdds(), store.ackedIDs())
+		}
+	})
+
+	t.Run("at limit enters DLQ", func(t *testing.T) {
+		store := &fakeRedisStreamStore{}
+		store.pendingFunc = func(context.Context, string, string, string) (redis.XPendingExt, bool, error) {
+			return redis.XPendingExt{ID: record.ID, RetryCount: 5}, true, nil
+		}
+		config := testRedisStreamRuntimeConfig()
+		mq := newRedisStreamMQ(store, config)
+		mq.processRedisStreamMessage(context.Background(), "orders", "stream", "billing",
+			func(context.Context, *Message) error { return handlerErr }, record, config)
+
+		adds := store.capturedAdds()
+		if len(adds) != 1 || adds[0].stream != mq.streamKey("orders.dlq") {
+			t.Fatalf("DLQ adds = %#v", adds)
+		}
+		dlq, err := messageFromRedisStreamRecord(redisStreamRecordFromValues("2000-0", adds[0].values))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(dlq.Key) != "order-1" || string(dlq.Body) != "payload" || string(dlq.Headers["trace"]) != "abc" ||
+			string(dlq.Headers[redisStreamDLQHeaderSourceTopic]) != "orders" ||
+			string(dlq.Headers[redisStreamDLQHeaderSourceGroup]) != "billing" ||
+			string(dlq.Headers[redisStreamDLQHeaderSourceMessageID]) != record.ID ||
+			string(dlq.Headers[redisStreamDLQHeaderDeliveryCount]) != "5" || !dlq.Timestamp.Equal(original.Timestamp) {
+			t.Fatalf("DLQ message = %#v", dlq)
+		}
+		if ids := store.ackedIDs(); !reflect.DeepEqual(ids, []string{record.ID}) {
+			t.Fatalf("acked IDs = %v", ids)
+		}
+	})
+}
+
+func TestRedisStreamDLQWriteFailureDoesNotAckSource(t *testing.T) {
+	record := testRedisStreamRecord(t, "1-0", &Message{Body: []byte("payload")})
+	store := &fakeRedisStreamStore{}
+	store.pendingFunc = func(context.Context, string, string, string) (redis.XPendingExt, bool, error) {
+		return redis.XPendingExt{ID: record.ID, RetryCount: 5}, true, nil
+	}
+	store.addFunc = func(context.Context, string, []interface{}, int64) (string, error) {
+		return "", errors.New("DLQ unavailable")
+	}
+	config := testRedisStreamRuntimeConfig()
+	mq := newRedisStreamMQ(store, config)
+	mq.processRedisStreamMessage(context.Background(), "orders", "stream", "billing",
+		func(context.Context, *Message) error { return errors.New("poison") }, record, config)
+	if ids := store.ackedIDs(); len(ids) != 0 {
+		t.Fatalf("source was acknowledged after DLQ failure: %v", ids)
+	}
+}
+
+func TestRedisStreamDecodeFailureMovesToDLQ(t *testing.T) {
 	var logs bytes.Buffer
 	store := &fakeRedisStreamStore{}
 	config := testRedisStreamRuntimeConfig()
 	config.logger = slog.New(slog.NewTextHandler(&logs, nil))
 	mq := newRedisStreamMQ(store, config)
 
-	mq.processRedisStreamMessage(
+	if ack := mq.processRedisStreamMessage(
 		context.Background(),
+		"topic",
 		"stream",
 		"group",
 		func(context.Context, *Message) error {
@@ -389,12 +546,25 @@ func TestRedisStreamDecodeFailureLogsAndAcknowledges(t *testing.T) {
 		},
 		redis.XMessage{ID: "1-0"},
 		config,
-	)
+	); ack {
+		t.Fatal("decode failure unexpectedly requested batch ack")
+	}
 
 	if ids := store.ackedIDs(); !reflect.DeepEqual(ids, []string{"1-0"}) {
 		t.Fatalf("acked IDs = %v, want [1-0]", ids)
 	}
-	if !bytes.Contains(logs.Bytes(), []byte("丢弃无法解码的 Redis Stream 消息")) ||
+	adds := store.capturedAdds()
+	if len(adds) != 1 || adds[0].stream != mq.streamKey("topic.dlq") {
+		t.Fatalf("DLQ adds = %#v", adds)
+	}
+	dlq, err := messageFromRedisStreamRecord(redisStreamRecordFromValues("2-0", adds[0].values))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(dlq.Headers[redisStreamDLQHeaderSourceMessageID]) != "1-0" || string(dlq.Body) != "null" {
+		t.Fatalf("DLQ message = %#v", dlq)
+	}
+	if !bytes.Contains(logs.Bytes(), []byte("Redis Stream 消息已进入 DLQ")) ||
 		!bytes.Contains(logs.Bytes(), []byte("message_id=1-0")) {
 		t.Fatalf("decode failure log = %q", logs.String())
 	}
@@ -412,7 +582,7 @@ func TestRedisStreamDecodeFailureAckErrorIsLogged(t *testing.T) {
 	mq := newRedisStreamMQ(store, config)
 
 	mq.processRedisStreamMessage(
-		context.Background(), "stream", "group",
+		context.Background(), "topic", "stream", "group",
 		func(context.Context, *Message) error { return nil },
 		redis.XMessage{ID: "1-0"}, config,
 	)
@@ -420,13 +590,27 @@ func TestRedisStreamDecodeFailureAckErrorIsLogged(t *testing.T) {
 	if ids := store.ackedIDs(); !reflect.DeepEqual(ids, []string{"1-0"}) {
 		t.Fatalf("ack attempts = %v, want [1-0]", ids)
 	}
-	if !bytes.Contains(logs.Bytes(), []byte("确认无法解码的 Redis Stream 消息失败")) ||
+	if !bytes.Contains(logs.Bytes(), []byte("进入 DLQ 后确认源消息失败")) ||
 		!bytes.Contains(logs.Bytes(), []byte(errAck.Error())) {
 		t.Fatalf("ack failure log = %q", logs.String())
 	}
 }
 
-func TestRedisStreamSuccessfulMessageAckUsesDetachedContext(t *testing.T) {
+func TestRedisStreamSuccessfulMessageRequestsBatchAck(t *testing.T) {
+	store := &fakeRedisStreamStore{}
+	mq := newRedisStreamMQ(store, testRedisStreamRuntimeConfig())
+	record := testRedisStreamRecord(t, "1-0", &Message{})
+	if ack := mq.processRedisStreamMessage(context.Background(), "topic", "stream", "group", func(context.Context, *Message) error {
+		return nil
+	}, record, mq.config); !ack {
+		t.Fatal("successful message did not request batch ack")
+	}
+	if ids := store.ackedIDs(); len(ids) != 0 {
+		t.Fatalf("processRedisStreamMessage performed synchronous ACK: %v", ids)
+	}
+}
+
+func TestRedisStreamAckWorkerBatchesAndUsesDetachedContext(t *testing.T) {
 	type contextKey string
 	const key contextKey = "trace"
 	parent, cancelParent := context.WithCancel(context.WithValue(context.Background(), key, "value"))
@@ -440,15 +624,51 @@ func TestRedisStreamSuccessfulMessageAckUsesDetachedContext(t *testing.T) {
 		}
 		return 1, nil
 	}
-	mq := newRedisStreamMQ(store, testRedisStreamRuntimeConfig())
-	record := testRedisStreamRecord(t, "1-0", &Message{})
-	mq.processRedisStreamMessage(parent, "stream", "group", func(context.Context, *Message) error {
-		return nil
-	}, record, mq.config)
+	config := testRedisStreamRuntimeConfig()
+	config.ackBatchSize = 2
+	config.ackFlushInterval = time.Hour
+	mq := newRedisStreamMQ(store, config)
+	subscription := &redisStreamSubscription{
+		ackQueue: make(chan string, 3), inFlight: map[string]struct{}{"1-0": {}, "2-0": {}, "3-0": {}},
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		mq.runRedisStreamAckWorker(parent, "stream", "group", config, subscription)
+	}()
+	subscription.ackQueue <- "1-0"
+	subscription.ackQueue <- "2-0"
+	waitForCondition(t, func() bool { return len(store.capturedAckCalls()) == 1 }, "full ACK batch was not flushed")
 	cancelParent()
+	subscription.ackQueue <- "3-0"
+	close(subscription.ackQueue)
+	waitForSignal(t, done)
 
-	if ids := store.ackedIDs(); !reflect.DeepEqual(ids, []string{"1-0"}) {
-		t.Fatalf("acked IDs = %v", ids)
+	if calls := store.capturedAckCalls(); !reflect.DeepEqual(calls, [][]string{{"1-0", "2-0"}, {"3-0"}}) {
+		t.Fatalf("ACK calls = %v", calls)
+	}
+}
+
+func TestRedisStreamAckWorkerFlushesPartialBatchOnTimer(t *testing.T) {
+	store := &fakeRedisStreamStore{}
+	config := testRedisStreamRuntimeConfig()
+	config.ackBatchSize = 64
+	config.ackFlushInterval = 5 * time.Millisecond
+	mq := newRedisStreamMQ(store, config)
+	subscription := &redisStreamSubscription{
+		ackQueue: make(chan string, 1), inFlight: map[string]struct{}{"1-0": {}},
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		mq.runRedisStreamAckWorker(context.Background(), "stream", "group", config, subscription)
+	}()
+	subscription.ackQueue <- "1-0"
+	waitForCondition(t, func() bool { return len(store.capturedAckCalls()) == 1 }, "partial ACK batch was not timer-flushed")
+	close(subscription.ackQueue)
+	waitForSignal(t, done)
+	if calls := store.capturedAckCalls(); !reflect.DeepEqual(calls, [][]string{{"1-0"}}) {
+		t.Fatalf("ACK calls = %v", calls)
 	}
 }
 
@@ -458,12 +678,21 @@ func TestRedisStreamAckFailureLeavesMessageForPendingRecovery(t *testing.T) {
 	store.ackFunc = func(context.Context, string, string, ...string) (int64, error) {
 		return 0, errAck
 	}
-	mq := newRedisStreamMQ(store, testRedisStreamRuntimeConfig())
-	record := testRedisStreamRecord(t, "1-0", &Message{})
-
-	mq.processRedisStreamMessage(context.Background(), "stream", "group", func(context.Context, *Message) error {
-		return nil
-	}, record, mq.config)
+	config := testRedisStreamRuntimeConfig()
+	config.ackBatchSize = 2
+	config.ackFlushInterval = time.Millisecond
+	mq := newRedisStreamMQ(store, config)
+	subscription := &redisStreamSubscription{
+		ackQueue: make(chan string, 1), inFlight: map[string]struct{}{"1-0": {}},
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		mq.runRedisStreamAckWorker(context.Background(), "stream", "group", config, subscription)
+	}()
+	subscription.ackQueue <- "1-0"
+	close(subscription.ackQueue)
+	waitForSignal(t, done)
 	if ids := store.ackedIDs(); !reflect.DeepEqual(ids, []string{"1-0"}) {
 		t.Fatalf("ack attempts = %v", ids)
 	}
@@ -699,6 +928,51 @@ func TestRedisStreamPendingRecoveryUsesAutoClaimCursor(t *testing.T) {
 	}
 }
 
+func TestRedisStreamPendingRecoveryLimitsWorkAndContinuesCursor(t *testing.T) {
+	store := &fakeRedisStreamStore{}
+	var starts []string
+	store.autoClaimFunc = func(
+		_ context.Context,
+		_ string,
+		_ string,
+		_ string,
+		_ time.Duration,
+		start string,
+		_ int64,
+	) ([]redis.XMessage, string, error) {
+		starts = append(starts, start)
+		switch start {
+		case "0-0":
+			return nil, "2-0", nil
+		case "2-0":
+			return nil, "4-0", nil
+		case "4-0":
+			return nil, "0-0", nil
+		default:
+			return nil, "0-0", nil
+		}
+	}
+
+	config := testRedisStreamRuntimeConfig()
+	config.reclaimMaxBatches = 2
+	mq := newRedisStreamMQ(store, config)
+	subscription := &redisStreamSubscription{
+		queue: make(chan redis.XMessage, 1), inFlight: make(map[string]struct{}), reclaimCursor: "0-0",
+	}
+	if err := mq.reclaimRedisStreamPending(context.Background(), "stream", "group", "consumer", config, subscription); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(starts, []string{"0-0", "2-0"}) || subscription.getReclaimCursor() != "4-0" {
+		t.Fatalf("first reclaim starts/cursor = %v/%q", starts, subscription.getReclaimCursor())
+	}
+	if err := mq.reclaimRedisStreamPending(context.Background(), "stream", "group", "consumer", config, subscription); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(starts, []string{"0-0", "2-0", "4-0"}) || subscription.getReclaimCursor() != "0-0" {
+		t.Fatalf("continued reclaim starts/cursor = %v/%q", starts, subscription.getReclaimCursor())
+	}
+}
+
 func TestRedisStreamPendingRecoveryRejectsInvalidCursor(t *testing.T) {
 	store := &fakeRedisStreamStore{}
 	store.autoClaimFunc = func(
@@ -740,7 +1014,7 @@ func TestRedisStreamFailedMessageIsRedeliveredFromPending(t *testing.T) {
 	record := testRedisStreamRecord(t, "1-0", &Message{})
 	var delivered atomic.Bool
 	var failed atomic.Bool
-	var claimed atomic.Bool
+	var acknowledged atomic.Bool
 	store := &fakeRedisStreamStore{}
 	store.readFunc = func(ctx context.Context, _ string, _ string, _ string, _ int64, _ time.Duration) ([]redis.XMessage, error) {
 		if delivered.CompareAndSwap(false, true) {
@@ -752,7 +1026,7 @@ func TestRedisStreamFailedMessageIsRedeliveredFromPending(t *testing.T) {
 	store.autoClaimFunc = func(
 		context.Context, string, string, string, time.Duration, string, int64,
 	) ([]redis.XMessage, string, error) {
-		if failed.Load() && claimed.CompareAndSwap(false, true) {
+		if failed.Load() && !acknowledged.Load() {
 			return []redis.XMessage{record}, "0-0", nil
 		}
 		return nil, "0-0", nil
@@ -763,7 +1037,9 @@ func TestRedisStreamFailedMessageIsRedeliveredFromPending(t *testing.T) {
 	var attempts atomic.Int32
 	acked := make(chan struct{})
 	store.ackFunc = func(context.Context, string, string, ...string) (int64, error) {
-		close(acked)
+		if acknowledged.CompareAndSwap(false, true) {
+			close(acked)
+		}
 		return 1, nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -787,42 +1063,46 @@ func TestRedisStreamFailedMessageIsRedeliveredFromPending(t *testing.T) {
 	}
 }
 
-func TestRedisStreamPollRecreatesMissingGroupAtZero(t *testing.T) {
-	record := testRedisStreamRecord(t, "1-0", &Message{})
-	var reads atomic.Int32
-	store := &fakeRedisStreamStore{}
-	store.readFunc = func(ctx context.Context, _ string, _ string, _ string, _ int64, _ time.Duration) ([]redis.XMessage, error) {
-		switch reads.Add(1) {
-		case 1:
-			return nil, errors.New("NOGROUP consumer group is missing")
-		case 2:
-			return []redis.XMessage{record}, nil
-		default:
-			<-ctx.Done()
-			return nil, ctx.Err()
-		}
-	}
-	acked := make(chan struct{})
-	store.ackFunc = func(context.Context, string, string, ...string) (int64, error) {
-		close(acked)
-		return 1, nil
-	}
+func TestRedisStreamPollRecreatesMissingGroupAtConfiguredStart(t *testing.T) {
+	for _, startID := range []string{"0", "123-4", "$"} {
+		t.Run(startID, func(t *testing.T) {
+			record := testRedisStreamRecord(t, "1-0", &Message{})
+			var reads atomic.Int32
+			store := &fakeRedisStreamStore{}
+			store.readFunc = func(ctx context.Context, _ string, _ string, _ string, _ int64, _ time.Duration) ([]redis.XMessage, error) {
+				switch reads.Add(1) {
+				case 1:
+					return nil, errors.New("NOGROUP consumer group is missing")
+				case 2:
+					return []redis.XMessage{record}, nil
+				default:
+					<-ctx.Done()
+					return nil, ctx.Err()
+				}
+			}
+			acked := make(chan struct{})
+			store.ackFunc = func(context.Context, string, string, ...string) (int64, error) {
+				close(acked)
+				return 1, nil
+			}
 
-	config := testRedisStreamRuntimeConfig()
-	config.groupStartID = "$"
-	ctx, cancel := context.WithCancel(context.Background())
-	mq := newRedisStreamMQ(store, config)
-	if err := mq.Subscribe(ctx, "orders", "billing", func(context.Context, *Message) error { return nil }); err != nil {
-		t.Fatal(err)
-	}
-	waitForSignal(t, acked)
-	cancel()
-	if err := mq.Close(); err != nil {
-		t.Fatal(err)
-	}
-	starts := store.capturedEnsureStarts()
-	if len(starts) < 2 || starts[0] != "$" || starts[1] != "0" {
-		t.Fatalf("group creation starts = %v", starts)
+			config := testRedisStreamRuntimeConfig()
+			config.groupStartID = startID
+			ctx, cancel := context.WithCancel(context.Background())
+			mq := newRedisStreamMQ(store, config)
+			if err := mq.Subscribe(ctx, "orders", "billing", func(context.Context, *Message) error { return nil }); err != nil {
+				t.Fatal(err)
+			}
+			waitForSignal(t, acked)
+			cancel()
+			if err := mq.Close(); err != nil {
+				t.Fatal(err)
+			}
+			starts := store.capturedEnsureStarts()
+			if len(starts) < 2 || starts[0] != startID || starts[1] != startID {
+				t.Fatalf("group creation starts = %v", starts)
+			}
+		})
 	}
 }
 
@@ -864,6 +1144,11 @@ func TestRedisStreamRuntimeDefaultsAndValidation(t *testing.T) {
 		config.redeliverInterval != 15*time.Second {
 		t.Fatalf("runtime timeout defaults = %#v", config)
 	}
+	if config.ackBatchSize != 64 || config.ackFlushInterval != 2*time.Millisecond ||
+		config.reclaimMaxBatches != 4 || config.maxDeliveryAttempts != 5 ||
+		config.consumerCleanupInterval != time.Hour || config.consumerCleanupIdleTimeout != 24*time.Hour {
+		t.Fatalf("runtime reliability defaults = %#v", config)
+	}
 
 	valid := MQConfig{
 		Type: MQTypeRedisStream, DSN: "redis://localhost:6379",
@@ -878,6 +1163,11 @@ func TestRedisStreamRuntimeDefaultsAndValidation(t *testing.T) {
 		{Type: MQTypeRedisStream, DSN: "redis://localhost:6379", RedisStream: &RedisStreamConfig{ConsumerBatchSize: -1}},
 		{Type: MQTypeRedisStream, DSN: "redis://localhost:6379", RedisStream: &RedisStreamConfig{QueueDepth: -1}},
 		{Type: MQTypeRedisStream, DSN: "redis://localhost:6379", RedisStream: &RedisStreamConfig{Concurrency: -1}},
+		{Type: MQTypeRedisStream, DSN: "redis://localhost:6379", RedisStream: &RedisStreamConfig{AckBatchSize: -1}},
+		{Type: MQTypeRedisStream, DSN: "redis://localhost:6379", RedisStream: &RedisStreamConfig{AckFlushInterval: -time.Second}},
+		{Type: MQTypeRedisStream, DSN: "redis://localhost:6379", RedisStream: &RedisStreamConfig{ReclaimMaxBatches: -1}},
+		{Type: MQTypeRedisStream, DSN: "redis://localhost:6379", RedisStream: &RedisStreamConfig{MaxDeliveryAttempts: -1}},
+		{Type: MQTypeRedisStream, DSN: "redis://localhost:6379", RedisStream: &RedisStreamConfig{ConsumerCleanupInterval: -time.Second}},
 		{Type: MQTypeRedisStream, DSN: "redis://localhost:6379", RedisStream: &RedisStreamConfig{GroupStartID: "invalid"}},
 		{Type: MQTypeRedisStream, DSN: "redis://localhost:6379", RedisStream: &RedisStreamConfig{HandlerTimeout: time.Minute, PendingIdleTimeout: time.Second}},
 		{Type: MQTypeRedisStream, DSN: "redis://localhost:6379", RedisStream: &RedisStreamConfig{RedeliverInterval: -time.Second}},
@@ -913,6 +1203,23 @@ func TestRedisStreamConsumerIDsAreUnique(t *testing.T) {
 	second := mq.subscriptionConsumerID()
 	if first == second || len(first) <= len("test-consumer:") {
 		t.Fatalf("consumer IDs = %q, %q", first, second)
+	}
+}
+
+func TestRedisStreamConsumerCleanupScopesCurrentAndStaleConsumers(t *testing.T) {
+	store := &fakeRedisStreamStore{}
+	config := testRedisStreamRuntimeConfig()
+	mq := newRedisStreamMQ(store, config)
+	mq.cleanupRedisStreamConsumer(context.Background(), "stream", "group", "current", config)
+	mq.cleanupStaleRedisStreamConsumers(context.Background(), "stream", "group", "current", config)
+
+	calls := store.capturedCleanupCalls()
+	want := []fakeRedisStreamCleanup{
+		{stream: "stream", group: "group", target: "current", minIdle: 0, limit: 1},
+		{stream: "stream", group: "group", exclude: "current", minIdle: 24 * time.Hour, limit: 128},
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("cleanup calls = %#v, want %#v", calls, want)
 	}
 }
 
