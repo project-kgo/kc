@@ -189,11 +189,14 @@ func (r *sourceRenderer) renderDAO(model *ModelSpec) {
 	b.WriteString("}\n\n")
 	fmt.Fprintf(b, "func (d *%sDAO) table(dialect sqlxgen.Dialect) string { return sqlxgen.QuoteTable(dialect, %q, %q) }\n", model.Name, model.Schema, model.Table)
 	fmt.Fprintf(b, "func (d *%sDAO) selectColumns(dialect sqlxgen.Dialect) string {\n", model.Name)
-	b.WriteString("\treturn strings.Join([]string{")
-	for _, field := range model.Fields {
-		fmt.Fprintf(b, "sqlxgen.QuoteIdentifier(dialect, %q),", field.Column)
+	fmt.Fprintf(b, "\tvar builder strings.Builder; builder.Grow(%d)\n", len(model.Fields)*16)
+	for index, field := range model.Fields {
+		if index > 0 {
+			b.WriteString("\tbuilder.WriteString(\", \")\n")
+		}
+		fmt.Fprintf(b, "\tbuilder.WriteString(sqlxgen.QuoteIdentifier(dialect, %q))\n", field.Column)
 	}
-	b.WriteString("}, \", \")\n}\n\n")
+	b.WriteString("\treturn builder.String()\n}\n\n")
 }
 
 func (r *sourceRenderer) columnDeclaration(field *FieldSpec) (string, string) {
@@ -253,8 +256,9 @@ func (r *sourceRenderer) renderQueryBuilder(model *ModelSpec) {
 	fmt.Fprintf(b, "\twhere, args, err := sqlxgen.BuildWhere(dialect, q.predicates, %sAllowedColumns); if err != nil { return \"\", nil, err }\n", lowerFirst(model.Name))
 	fmt.Fprintf(b, "\torder, err := sqlxgen.BuildOrder(dialect, q.orders, %sAllowedColumns); if err != nil { return \"\", nil, err }\n", lowerFirst(model.Name))
 	b.WriteString("\tpagination, pageArgs, err := sqlxgen.BuildPagination(dialect, q.limit, q.offset); if err != nil { return \"\", nil, err }\n")
-	b.WriteString("\tquery := \"SELECT \" + q.dao.selectColumns(dialect) + \" FROM \" + q.dao.table(dialect) + where + order + pagination\n")
-	b.WriteString("\treturn q.dao.exec.Rebind(query), append(args, pageArgs...), nil\n}\n\n")
+	b.WriteString("\tcolumns, table := q.dao.selectColumns(dialect), q.dao.table(dialect); var builder strings.Builder; builder.Grow(len(columns) + len(table) + len(where) + len(order) + len(pagination) + 13)\n")
+	b.WriteString("\tbuilder.WriteString(\"SELECT \"); builder.WriteString(columns); builder.WriteString(\" FROM \"); builder.WriteString(table); builder.WriteString(where); builder.WriteString(order); builder.WriteString(pagination)\n")
+	b.WriteString("\treturn q.dao.exec.Rebind(builder.String()), append(args, pageArgs...), nil\n}\n\n")
 
 	fmt.Fprintf(b, "func (q %s) First(ctx context.Context) (*%s, error) {\n", queryType, model.Name)
 	b.WriteString("\tlimit := 1; q.limit = &limit\n\tquery, args, err := q.selectSQL(); if err != nil { return nil, err }\n")
@@ -265,12 +269,12 @@ func (r *sourceRenderer) renderQueryBuilder(model *ModelSpec) {
 	fmt.Fprintf(b, "func (q %s) Count(ctx context.Context) (int64, error) {\n", queryType)
 	b.WriteString("\tif q.dao == nil { return 0, fmt.Errorf(\"sqlxgen: query DAO is nil\") }; dialect, err := sqlxgen.DetectDialect(q.dao.exec); if err != nil { return 0, err }\n")
 	fmt.Fprintf(b, "\twhere, args, err := sqlxgen.BuildWhere(dialect, q.predicates, %sAllowedColumns); if err != nil { return 0, err }\n", lowerFirst(model.Name))
-	b.WriteString("\tquery := q.dao.exec.Rebind(\"SELECT COUNT(*) FROM \" + q.dao.table(dialect) + where); var result int64\n")
+	b.WriteString("\ttable := q.dao.table(dialect); var builder strings.Builder; builder.Grow(len(table) + len(where) + 21); builder.WriteString(\"SELECT COUNT(*) FROM \"); builder.WriteString(table); builder.WriteString(where); query := q.dao.exec.Rebind(builder.String()); var result int64\n")
 	b.WriteString("\tif err := sqlx.GetContext(ctx, q.dao.exec, &result, query, args...); err != nil { return 0, err }; return result, nil\n}\n\n")
 	fmt.Fprintf(b, "func (q %s) Exists(ctx context.Context) (bool, error) {\n", queryType)
 	b.WriteString("\tif q.dao == nil { return false, fmt.Errorf(\"sqlxgen: query DAO is nil\") }; dialect, err := sqlxgen.DetectDialect(q.dao.exec); if err != nil { return false, err }\n")
 	fmt.Fprintf(b, "\twhere, args, err := sqlxgen.BuildWhere(dialect, q.predicates, %sAllowedColumns); if err != nil { return false, err }\n", lowerFirst(model.Name))
-	b.WriteString("\tquery := q.dao.exec.Rebind(\"SELECT EXISTS(SELECT 1 FROM \" + q.dao.table(dialect) + where + \")\"); var result bool\n")
+	b.WriteString("\ttable := q.dao.table(dialect); var builder strings.Builder; builder.Grow(len(table) + len(where) + 30); builder.WriteString(\"SELECT EXISTS(SELECT 1 FROM \"); builder.WriteString(table); builder.WriteString(where); builder.WriteByte(')'); query := q.dao.exec.Rebind(builder.String()); var result bool\n")
 	b.WriteString("\tif err := sqlx.GetContext(ctx, q.dao.exec, &result, query, args...); err != nil { return false, err }; return result, nil\n}\n\n")
 
 	fmt.Fprintf(b, "func (q %s) Update(ctx context.Context, assignments ...sqlxgen.Assignment) (int64, error) {\n", queryType)
@@ -278,12 +282,12 @@ func (r *sourceRenderer) renderQueryBuilder(model *ModelSpec) {
 	b.WriteString("\tdialect, err := sqlxgen.DetectDialect(q.dao.exec); if err != nil { return 0, err }\n")
 	fmt.Fprintf(b, "\tset, args, err := sqlxgen.BuildAssignments(dialect, assignments, %sAllowedColumns); if err != nil { return 0, err }\n", lowerFirst(model.Name))
 	fmt.Fprintf(b, "\twhere, whereArgs, err := sqlxgen.BuildWhere(dialect, q.predicates, %sAllowedColumns); if err != nil { return 0, err }; args = append(args, whereArgs...)\n", lowerFirst(model.Name))
-	b.WriteString("\tquery := q.dao.exec.Rebind(\"UPDATE \" + q.dao.table(dialect) + \" SET \" + set + where); result, err := q.dao.exec.ExecContext(ctx, query, args...); if err != nil { return 0, err }; return result.RowsAffected()\n}\n\n")
+	b.WriteString("\ttable := q.dao.table(dialect); var builder strings.Builder; builder.Grow(len(table) + len(set) + len(where) + 12); builder.WriteString(\"UPDATE \"); builder.WriteString(table); builder.WriteString(\" SET \"); builder.WriteString(set); builder.WriteString(where); query := q.dao.exec.Rebind(builder.String()); result, err := q.dao.exec.ExecContext(ctx, query, args...); if err != nil { return 0, err }; return result.RowsAffected()\n}\n\n")
 	fmt.Fprintf(b, "func (q %s) Delete(ctx context.Context) (int64, error) {\n", queryType)
 	b.WriteString("\tif q.dao == nil { return 0, fmt.Errorf(\"sqlxgen: query DAO is nil\") }; if sqlxgen.IsUnrestricted(q.predicates) && !q.allowAll { return 0, sqlxgen.ErrUnsafeMutation }\n")
 	b.WriteString("\tdialect, err := sqlxgen.DetectDialect(q.dao.exec); if err != nil { return 0, err }\n")
 	fmt.Fprintf(b, "\twhere, args, err := sqlxgen.BuildWhere(dialect, q.predicates, %sAllowedColumns); if err != nil { return 0, err }\n", lowerFirst(model.Name))
-	b.WriteString("\tquery := q.dao.exec.Rebind(\"DELETE FROM \" + q.dao.table(dialect) + where); result, err := q.dao.exec.ExecContext(ctx, query, args...); if err != nil { return 0, err }; return result.RowsAffected()\n}\n\n")
+	b.WriteString("\ttable := q.dao.table(dialect); var builder strings.Builder; builder.Grow(len(table) + len(where) + 12); builder.WriteString(\"DELETE FROM \"); builder.WriteString(table); builder.WriteString(where); query := q.dao.exec.Rebind(builder.String()); result, err := q.dao.exec.ExecContext(ctx, query, args...); if err != nil { return 0, err }; return result.RowsAffected()\n}\n\n")
 }
 
 func (r *sourceRenderer) renderCreate(model *ModelSpec) {
@@ -294,7 +298,7 @@ func (r *sourceRenderer) renderCreate(model *ModelSpec) {
 	b.WriteString(model.Name)
 	b.WriteString("Create(defaults) }\n")
 	fmt.Fprintf(b, "\tfor column := range defaults { if _, ok := %sDefaultColumns[column]; !ok { return fmt.Errorf(\"%%w: column %%q has no database default\", sqlxgen.ErrInvalidArgument, column) } }\n", lowerFirst(model.Name))
-	b.WriteString("\tcolumns := make([]string, 0); placeholders := make([]string, 0); args := make([]any, 0)\n")
+	fmt.Fprintf(b, "\tvar columns, placeholders strings.Builder; columns.Grow(%d); placeholders.Grow(%d); columnCount := 0; args := make([]any, 0, %d)\n", len(model.Fields)*16, len(model.Fields)*3, len(model.Fields))
 	for _, field := range model.Fields {
 		if field.Auto {
 			continue
@@ -302,19 +306,21 @@ func (r *sourceRenderer) renderCreate(model *ModelSpec) {
 		if field.Default != "" {
 			fmt.Fprintf(b, "\tif _, useDefault := defaults[%q]; !useDefault {\n", field.Column)
 		}
-		fmt.Fprintf(b, "\t\tcolumns = append(columns, sqlxgen.QuoteIdentifier(dialect, %q)); placeholders = append(placeholders, \"?\"); args = append(args, value.%s)\n", field.Column, field.Access)
+		b.WriteString("\t\tif columnCount > 0 { columns.WriteString(\", \"); placeholders.WriteString(\", \") }\n")
+		fmt.Fprintf(b, "\t\tcolumns.WriteString(sqlxgen.QuoteIdentifier(dialect, %q)); placeholders.WriteByte('?'); columnCount++; args = append(args, value.%s)\n", field.Column, field.Access)
 		if field.Default != "" {
 			b.WriteString("\t}\n")
 		}
 	}
-	b.WriteString("\tvar query string; if len(columns) == 0 { if dialect == sqlxgen.DialectMySQL { query = \"INSERT INTO \" + d.table(dialect) + \" () VALUES ()\" } else { query = \"INSERT INTO \" + d.table(dialect) + \" DEFAULT VALUES\" } } else { query = \"INSERT INTO \" + d.table(dialect) + \" (\" + strings.Join(columns, \", \") + \") VALUES (\" + strings.Join(placeholders, \", \") + \")\" }\n")
+	b.WriteString("\ttable := d.table(dialect); var builder strings.Builder; builder.Grow(len(table) + columns.Len() + placeholders.Len() + 32); builder.WriteString(\"INSERT INTO \"); builder.WriteString(table)\n")
+	b.WriteString("\tif columnCount == 0 { if dialect == sqlxgen.DialectMySQL { builder.WriteString(\" () VALUES ()\") } else { builder.WriteString(\" DEFAULT VALUES\") } } else { builder.WriteString(\" (\"); builder.WriteString(columns.String()); builder.WriteString(\") VALUES (\"); builder.WriteString(placeholders.String()); builder.WriteByte(')') }\n")
 	if model.Auto != nil {
-		fmt.Fprintf(b, "\tif dialect == sqlxgen.DialectPostgreSQL { query += \" RETURNING \" + sqlxgen.QuoteIdentifier(dialect, %q); return d.exec.QueryRowxContext(ctx, d.exec.Rebind(query), args...).Scan(&value.%s) }\n", model.Auto.Column, model.Auto.Access)
-		b.WriteString("\tresult, err := d.exec.ExecContext(ctx, d.exec.Rebind(query), args...); if err != nil { return err }; id, err := result.LastInsertId(); if err != nil { return err }; return sqlxgen.AssignAutoID(&value.")
+		fmt.Fprintf(b, "\tif dialect == sqlxgen.DialectPostgreSQL { builder.WriteString(\" RETURNING \"); builder.WriteString(sqlxgen.QuoteIdentifier(dialect, %q)); return d.exec.QueryRowxContext(ctx, d.exec.Rebind(builder.String()), args...).Scan(&value.%s) }\n", model.Auto.Column, model.Auto.Access)
+		b.WriteString("\tresult, err := d.exec.ExecContext(ctx, d.exec.Rebind(builder.String()), args...); if err != nil { return err }; id, err := result.LastInsertId(); if err != nil { return err }; return sqlxgen.AssignAutoID(&value.")
 		b.WriteString(model.Auto.Access)
 		b.WriteString(", id)\n}\n\n")
 	} else {
-		b.WriteString("\t_, err = d.exec.ExecContext(ctx, d.exec.Rebind(query), args...); return err\n}\n\n")
+		b.WriteString("\t_, err = d.exec.ExecContext(ctx, d.exec.Rebind(builder.String()), args...); return err\n}\n\n")
 	}
 	fmt.Fprintf(b, "func (d *%sDAO) Reload(ctx context.Context, value *%s) error {\n", model.Name, model.Name)
 	b.WriteString("\tif value == nil { return fmt.Errorf(\"%w: value is nil\", sqlxgen.ErrInvalidArgument) }\n")

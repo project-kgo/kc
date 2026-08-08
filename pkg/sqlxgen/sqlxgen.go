@@ -114,7 +114,20 @@ func (e comparisonExpr) render(dialect Dialect) (string, []any, error) {
 			}
 			return "1 = 1", nil, nil
 		}
-		return column + " " + e.op + " (" + strings.TrimSuffix(strings.Repeat("?, ", len(e.values)), ", ") + ")", e.values, nil
+		var builder strings.Builder
+		builder.Grow(len(column) + len(e.op) + 4 + len(e.values)*3)
+		builder.WriteString(column)
+		builder.WriteByte(' ')
+		builder.WriteString(e.op)
+		builder.WriteString(" (")
+		for index := range e.values {
+			if index > 0 {
+				builder.WriteString(", ")
+			}
+			builder.WriteByte('?')
+		}
+		builder.WriteByte(')')
+		return builder.String(), e.values, nil
 	case "BETWEEN":
 		return column + " BETWEEN ? AND ?", e.values, nil
 	default:
@@ -134,9 +147,10 @@ func (e groupExpr) render(dialect Dialect) (string, []any, error) {
 		}
 		return "1 = 0", nil, nil
 	}
-	parts := make([]string, 0, len(e.exprs))
-	var arguments []any
-	for _, expression := range e.exprs {
+	var builder strings.Builder
+	builder.Grow(len(e.exprs) * 16)
+	arguments := make([]any, 0, len(e.exprs))
+	for index, expression := range e.exprs {
 		if expression == nil {
 			return "", nil, fmt.Errorf("%w: expression is nil", ErrInvalidArgument)
 		}
@@ -144,10 +158,17 @@ func (e groupExpr) render(dialect Dialect) (string, []any, error) {
 		if err != nil {
 			return "", nil, err
 		}
-		parts = append(parts, "("+part+")")
+		if index > 0 {
+			builder.WriteByte(' ')
+			builder.WriteString(e.op)
+			builder.WriteByte(' ')
+		}
+		builder.WriteByte('(')
+		builder.WriteString(part)
+		builder.WriteByte(')')
 		arguments = append(arguments, args...)
 	}
-	return strings.Join(parts, " "+e.op+" "), arguments, nil
+	return builder.String(), arguments, nil
 }
 
 type notExpr struct{ expr Expr }
@@ -157,7 +178,15 @@ func (e notExpr) render(dialect Dialect) (string, []any, error) {
 		return "", nil, fmt.Errorf("%w: expression is nil", ErrInvalidArgument)
 	}
 	query, args, err := e.expr.render(dialect)
-	return "NOT (" + query + ")", args, err
+	if err != nil {
+		return "", nil, err
+	}
+	var builder strings.Builder
+	builder.Grow(len(query) + len("NOT ()"))
+	builder.WriteString("NOT (")
+	builder.WriteString(query)
+	builder.WriteByte(')')
+	return builder.String(), args, nil
 }
 
 // And 组合多个必须同时成立的条件。
@@ -193,13 +222,23 @@ func (a assignment) renderAssignment(dialect Dialect) (string, []any, error) {
 		return "", nil, fmt.Errorf("%w: assignment column is empty", ErrInvalidArgument)
 	}
 	column := QuoteIdentifier(dialect, a.column)
+	var builder strings.Builder
+	builder.Grow(len(column)*2 + 8)
+	builder.WriteString(column)
 	switch a.op {
 	case "NULL":
-		return column + " = NULL", nil, nil
+		builder.WriteString(" = NULL")
+		return builder.String(), nil, nil
 	case "+", "-":
-		return column + " = " + column + " " + a.op + " ?", []any{a.value}, nil
+		builder.WriteString(" = ")
+		builder.WriteString(column)
+		builder.WriteByte(' ')
+		builder.WriteString(a.op)
+		builder.WriteString(" ?")
+		return builder.String(), []any{a.value}, nil
 	default:
-		return column + " = ?", []any{a.value}, nil
+		builder.WriteString(" = ?")
+		return builder.String(), []any{a.value}, nil
 	}
 }
 
@@ -229,7 +268,12 @@ func (o order) renderOrder(dialect Dialect) (string, error) {
 	if o.desc {
 		direction = " DESC"
 	}
-	return QuoteIdentifier(dialect, o.column) + direction, nil
+	column := QuoteIdentifier(dialect, o.column)
+	var builder strings.Builder
+	builder.Grow(len(column) + len(direction))
+	builder.WriteString(column)
+	builder.WriteString(direction)
+	return builder.String(), nil
 }
 
 // ColumnKey 构造生成列的模型内唯一键。
@@ -421,7 +465,11 @@ func BuildWhere(dialect Dialect, exprs []Expr, allowed map[string]struct{}) (str
 	if err != nil {
 		return "", nil, err
 	}
-	return " WHERE " + query, args, nil
+	var builder strings.Builder
+	builder.Grow(len(query) + len(" WHERE "))
+	builder.WriteString(" WHERE ")
+	builder.WriteString(query)
+	return builder.String(), args, nil
 }
 
 func validateExprColumns(exprs []Expr, allowed map[string]struct{}) error {
@@ -534,8 +582,9 @@ func BuildAssignments(dialect Dialect, assignments []Assignment, allowed map[str
 	if len(assignments) == 0 {
 		return "", nil, fmt.Errorf("%w: assignments are empty", ErrInvalidArgument)
 	}
-	parts := make([]string, 0, len(assignments))
-	var args []any
+	var builder strings.Builder
+	builder.Grow(len(assignments) * 16)
+	args := make([]any, 0, len(assignments))
 	seen := make(map[string]struct{}, len(assignments))
 	for _, item := range assignments {
 		if item == nil {
@@ -554,10 +603,13 @@ func BuildAssignments(dialect Dialect, assignments []Assignment, allowed map[str
 		if err != nil {
 			return "", nil, err
 		}
-		parts = append(parts, part)
+		if builder.Len() > 0 {
+			builder.WriteString(", ")
+		}
+		builder.WriteString(part)
 		args = append(args, values...)
 	}
-	return strings.Join(parts, ", "), args, nil
+	return builder.String(), args, nil
 }
 
 // BuildOrder 渲染并校验排序。
@@ -565,7 +617,9 @@ func BuildOrder(dialect Dialect, orders []Order, allowed map[string]struct{}) (s
 	if len(orders) == 0 {
 		return "", nil
 	}
-	parts := make([]string, 0, len(orders))
+	var builder strings.Builder
+	builder.Grow(len(orders) * 16)
+	builder.WriteString(" ORDER BY ")
 	for _, item := range orders {
 		if item == nil {
 			return "", fmt.Errorf("%w: order is nil", ErrInvalidArgument)
@@ -578,9 +632,12 @@ func BuildOrder(dialect Dialect, orders []Order, allowed map[string]struct{}) (s
 		if err != nil {
 			return "", err
 		}
-		parts = append(parts, part)
+		if index := builder.Len(); index > len(" ORDER BY ") {
+			builder.WriteString(", ")
+		}
+		builder.WriteString(part)
 	}
-	return " ORDER BY " + strings.Join(parts, ", "), nil
+	return builder.String(), nil
 }
 
 // BuildPagination 渲染分页语句并返回对应参数。
