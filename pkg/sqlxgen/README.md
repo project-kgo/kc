@@ -51,23 +51,33 @@ type User struct {
 
 ```shell
 go run github.com/project-kgo/kc/cmd/sqlxgen generate \
-  -patterns=./... \
-  -ddl-out=./schema/generated
+  -patterns=./...
 ```
 
 也可以先安装命令：
 
 ```shell
 go install github.com/project-kgo/kc/cmd/sqlxgen@latest
-sqlxgen generate -patterns=./... -ddl-out=./schema/generated
+sqlxgen generate -patterns=./...
 ```
 
-生成结果：
+默认只生成 Go 代码：
 
 ```text
 model/
 ├── user.go
 └── zz_sqlxgen.gen.go
+```
+
+需要同时生成初始 DDL 时显式指定输出目录：
+
+```shell
+sqlxgen generate -patterns=./... -ddl-out=./schema/generated
+```
+
+此时额外生成：
+
+```text
 schema/generated/
 ├── schema.mysql.sql
 └── schema.postgres.sql
@@ -308,14 +318,14 @@ ID uuid.UUID `db:"id" sqlxgen:"pk;mysql_type=BINARY(16);postgres_type=UUID"`
 ## 生成命令
 
 ```text
-sqlxgen generate [-dir .] [-patterns ./...] [-ddl-out ./schema/generated]
+sqlxgen generate [-dir .] [-patterns ./...] [-ddl-out DIR]
 ```
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `-dir` | `.` | Go 模块扫描工作目录 |
 | `-patterns` | `./...` | 逗号分隔的 `go/packages` pattern |
-| `-ddl-out` | `./schema/generated` | DDL 输出目录；传空字符串时不写 DDL |
+| `-ddl-out` | 空 | DDL 输出目录；不指定时不生成 DDL |
 
 相对的 `-ddl-out` 以 `-dir` 为基准解析；目标目录不存在时会自动创建。
 
@@ -328,14 +338,14 @@ sqlxgen generate \
   -patterns=./internal/model,./pkg/account/model \
   -ddl-out=./migrations/generated
 
-# 只生成 Go 代码
-sqlxgen generate -patterns=./internal/model -ddl-out=
+# 默认只生成 Go 代码
+sqlxgen generate -patterns=./internal/model
 ```
 
 可以在模块根目录的 Go 文件中加入：
 
 ```go
-//go:generate go run github.com/project-kgo/kc/cmd/sqlxgen generate -patterns=./... -ddl-out=./schema/generated
+//go:generate go run github.com/project-kgo/kc/cmd/sqlxgen generate -patterns=./...
 ```
 
 生成器先完成所有扫描、标签校验和 Go 格式化，再通过临时文件原子替换旧产物。生成失败时不会用不完整内容覆盖目标文件。
