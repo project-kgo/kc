@@ -113,6 +113,129 @@ func TestSetAndGetNilResources(t *testing.T) {
 	}
 }
 
+func TestGetOrCreateReusesExistingResource(t *testing.T) {
+	const name = "resource-test-get-or-create-existing"
+	want := &testClient{name: "existing"}
+	if err := Set(name, want); err != nil {
+		t.Fatal(err)
+	}
+
+	called := false
+	got, err := GetOrCreate(name, func() (*testClient, error) {
+		called = true
+		return &testClient{name: "new"}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Fatal("已有资源时不应调用 factory")
+	}
+	if got != want {
+		t.Fatal("GetOrCreate 必须返回已有资源")
+	}
+}
+
+func TestGetOrCreateCreatesResource(t *testing.T) {
+	const name = "resource-test-get-or-create-new"
+	want := &testClient{name: "new"}
+
+	got, err := GetOrCreate(name, func() (*testClient, error) {
+		return want, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatal("GetOrCreate 必须返回新创建的资源")
+	}
+	if stored, ok := Get[*testClient](name); !ok || stored != want {
+		t.Fatal("GetOrCreate 未保存新创建的资源")
+	}
+}
+
+func TestGetOrCreateRetriesAfterFactoryError(t *testing.T) {
+	const name = "resource-test-get-or-create-retry"
+	wantErr := errors.New("create failed")
+
+	if _, err := GetOrCreate(name, func() (*testClient, error) {
+		return nil, wantErr
+	}); !errors.Is(err, wantErr) {
+		t.Fatalf("GetOrCreate error = %v, want %v", err, wantErr)
+	}
+	if _, ok := Get[*testClient](name); ok {
+		t.Fatal("创建失败的资源不应被缓存")
+	}
+
+	want := &testClient{name: "retry"}
+	got, err := GetOrCreate(name, func() (*testClient, error) {
+		return want, nil
+	})
+	if err != nil || got != want {
+		t.Fatalf("retry GetOrCreate = (%v, %v), want (%v, nil)", got, err, want)
+	}
+}
+
+func TestConcurrentGetOrCreateCallsFactoryOnce(t *testing.T) {
+	const (
+		name    = "resource-test-get-or-create-concurrent"
+		workers = 32
+	)
+	want := &testClient{name: "shared"}
+	start := make(chan struct{})
+	results := make(chan *testClient, workers)
+	errs := make(chan error, workers)
+	var calls int
+	var callsMu sync.Mutex
+	var wg sync.WaitGroup
+
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			got, err := GetOrCreate(name, func() (*testClient, error) {
+				callsMu.Lock()
+				calls++
+				callsMu.Unlock()
+				return want, nil
+			})
+			results <- got
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for got := range results {
+		if got != want {
+			t.Fatal("并发调用必须返回同一个资源")
+		}
+	}
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if calls != 1 {
+		t.Fatalf("factory calls = %d, want 1", calls)
+	}
+}
+
+func TestGetOrCreateValidatesArguments(t *testing.T) {
+	factory := func() (int, error) { return 1, nil }
+	if _, err := GetOrCreate("", factory); !errors.Is(err, ErrEmptyName) {
+		t.Fatalf("GetOrCreate empty name error = %v, want ErrEmptyName", err)
+	}
+	if _, err := GetOrCreate[int]("resource-test-nil-factory", nil); !errors.Is(err, ErrNilFactory) {
+		t.Fatalf("GetOrCreate nil factory error = %v, want ErrNilFactory", err)
+	}
+}
+
 func TestConcurrentSetAndGet(t *testing.T) {
 	const (
 		name       = "resource-test-concurrent"
