@@ -12,6 +12,7 @@ import (
 
 // ErrInvalidArgument 表示 Transaction 收到了非法参数。
 var ErrInvalidArgument = errors.New("sqlxhelper: invalid argument")
+var ErrSilenceRollback = errors.New("sqlxhelper: silence rollback")
 
 // Handler 表示在事务中执行的业务逻辑。
 type Handler func(*sqlx.Tx) error
@@ -43,7 +44,9 @@ func Transaction(ctx context.Context, db *sqlx.DB, handler Handler) (err error) 
 		if err == nil {
 			return
 		}
-
+		if errors.Is(err, ErrSilenceRollback) {
+			err = nil
+		}
 		rollbackErr := tx.Rollback()
 		if rollbackErr == nil || errors.Is(rollbackErr, sql.ErrTxDone) {
 			return
