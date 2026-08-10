@@ -3,6 +3,7 @@ package resource
 
 import (
 	"errors"
+	"io"
 	"reflect"
 	"sync"
 )
@@ -63,6 +64,27 @@ func Get[T any](name string) (T, bool) {
 		return zero, false
 	}
 	return cast[T](value), true
+}
+
+// Shutdown 关闭当前已注册且实现 io.Closer 的全部资源，并清空这些资源的注册记录。
+// 关闭期间新注册或仍在创建的资源不属于本次关闭范围。
+func Shutdown() error {
+	resources.Lock()
+	values := resources.values
+	resources.values = make(map[resourceKey]any)
+	resources.Unlock()
+
+	var errs []error
+	for _, value := range values {
+		closer, ok := value.(io.Closer)
+		if !ok || isNil(closer) {
+			continue
+		}
+		if err := closer.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // GetOrCreate 按名称和声明类型获取资源；资源不存在时调用 factory 创建并保存。
@@ -146,4 +168,18 @@ func cast[T any](value any) T {
 		return zero
 	}
 	return value.(T)
+}
+
+func isNil(value any) bool {
+	if value == nil {
+		return true
+	}
+
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
 }

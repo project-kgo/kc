@@ -3,6 +3,7 @@ package resource
 import (
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"testing"
 )
@@ -19,8 +20,22 @@ type testClient struct {
 	name string
 }
 
+type testCloser struct {
+	closeErr error
+	onClose  func()
+	calls    int
+}
+
 func (c *testClient) Name() string {
 	return c.name
+}
+
+func (c *testCloser) Close() error {
+	c.calls++
+	if c.onClose != nil {
+		c.onClose()
+	}
+	return c.closeErr
 }
 
 func TestSetAndGet(t *testing.T) {
@@ -269,4 +284,175 @@ func TestConcurrentSetAndGet(t *testing.T) {
 	for err := range errCh {
 		t.Error(err)
 	}
+}
+
+func TestShutdownClosesResourcesAndClearsRegistry(t *testing.T) {
+	prepareShutdownTest(t)
+
+	closer := &testCloser{}
+	if err := Set("resource-test-shutdown-closer", closer); err != nil {
+		t.Fatal(err)
+	}
+	if err := Set("resource-test-shutdown-value", 42); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Shutdown(); err != nil {
+		t.Fatalf("Shutdown error = %v, want nil", err)
+	}
+	if closer.calls != 1 {
+		t.Fatalf("Close calls = %d, want 1", closer.calls)
+	}
+	if _, ok := Get[*testCloser]("resource-test-shutdown-closer"); ok {
+		t.Fatal("Shutdown 后 Closer 资源仍然存在")
+	}
+	if _, ok := Get[int]("resource-test-shutdown-value"); ok {
+		t.Fatal("Shutdown 后普通资源仍然存在")
+	}
+
+	if err := Shutdown(); err != nil {
+		t.Fatalf("second Shutdown error = %v, want nil", err)
+	}
+	if closer.calls != 1 {
+		t.Fatalf("second Shutdown Close calls = %d, want 1", closer.calls)
+	}
+}
+
+func TestShutdownAggregatesCloseErrorsAndContinues(t *testing.T) {
+	prepareShutdownTest(t)
+
+	firstErr := errors.New("first close failed")
+	secondErr := errors.New("second close failed")
+	first := &testCloser{closeErr: firstErr}
+	second := &testCloser{closeErr: secondErr}
+	if err := Set("resource-test-shutdown-error-first", first); err != nil {
+		t.Fatal(err)
+	}
+	if err := Set("resource-test-shutdown-error-second", second); err != nil {
+		t.Fatal(err)
+	}
+
+	err := Shutdown()
+	if !errors.Is(err, firstErr) || !errors.Is(err, secondErr) {
+		t.Fatalf("Shutdown error = %v, want both close errors", err)
+	}
+	if first.calls != 1 || second.calls != 1 {
+		t.Fatalf("Close calls = (%d, %d), want (1, 1)", first.calls, second.calls)
+	}
+	if _, ok := Get[*testCloser]("resource-test-shutdown-error-first"); ok {
+		t.Fatal("关闭失败的资源仍然存在")
+	}
+	if _, ok := Get[*testCloser]("resource-test-shutdown-error-second"); ok {
+		t.Fatal("关闭失败的资源仍然存在")
+	}
+}
+
+func TestShutdownSkipsNilClosers(t *testing.T) {
+	prepareShutdownTest(t)
+
+	var typedNil *testCloser
+	if err := Set("resource-test-shutdown-typed-nil", typedNil); err != nil {
+		t.Fatal(err)
+	}
+	var nilCloser io.Closer
+	if err := Set[io.Closer]("resource-test-shutdown-nil-interface", nilCloser); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Shutdown(); err != nil {
+		t.Fatalf("Shutdown error = %v, want nil", err)
+	}
+	if _, ok := Get[*testCloser]("resource-test-shutdown-typed-nil"); ok {
+		t.Fatal("Shutdown 后 typed nil 资源仍然存在")
+	}
+	if _, ok := Get[io.Closer]("resource-test-shutdown-nil-interface"); ok {
+		t.Fatal("Shutdown 后 nil 接口资源仍然存在")
+	}
+}
+
+func TestShutdownClosesEachRegistration(t *testing.T) {
+	prepareShutdownTest(t)
+
+	closer := &testCloser{}
+	if err := Set("resource-test-shutdown-duplicate-first", closer); err != nil {
+		t.Fatal(err)
+	}
+	if err := Set("resource-test-shutdown-duplicate-second", closer); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Shutdown(); err != nil {
+		t.Fatalf("Shutdown error = %v, want nil", err)
+	}
+	if closer.calls != 2 {
+		t.Fatalf("Close calls = %d, want 2", closer.calls)
+	}
+}
+
+func TestShutdownAllowsCloseToRegisterReplacement(t *testing.T) {
+	prepareShutdownTest(t)
+
+	const name = "resource-test-shutdown-reentrant"
+	replacement := &testCloser{}
+	var registerErr error
+	original := &testCloser{onClose: func() {
+		registerErr = Set(name, replacement)
+	}}
+	if err := Set(name, original); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Shutdown(); err != nil {
+		t.Fatalf("Shutdown error = %v, want nil", err)
+	}
+	if registerErr != nil {
+		t.Fatalf("Close 中重新注册资源失败: %v", registerErr)
+	}
+	if got, ok := Get[*testCloser](name); !ok || got != replacement {
+		t.Fatalf("Get replacement = (%v, %v), want (%v, true)", got, ok, replacement)
+	}
+}
+
+func TestShutdownDoesNotWaitForCreatingResource(t *testing.T) {
+	prepareShutdownTest(t)
+
+	const name = "resource-test-shutdown-creating"
+	closer := &testCloser{}
+	factoryStarted := make(chan struct{})
+	releaseFactory := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		_, err := GetOrCreate(name, func() (*testCloser, error) {
+			close(factoryStarted)
+			<-releaseFactory
+			return closer, nil
+		})
+		result <- err
+	}()
+
+	<-factoryStarted
+	if err := Shutdown(); err != nil {
+		t.Fatalf("Shutdown error = %v, want nil", err)
+	}
+	close(releaseFactory)
+	if err := <-result; err != nil {
+		t.Fatalf("GetOrCreate error = %v, want nil", err)
+	}
+
+	if closer.calls != 0 {
+		t.Fatalf("Close calls = %d, want 0", closer.calls)
+	}
+	if got, ok := Get[*testCloser](name); !ok || got != closer {
+		t.Fatalf("Get created resource = (%v, %v), want (%v, true)", got, ok, closer)
+	}
+}
+
+func prepareShutdownTest(t *testing.T) {
+	t.Helper()
+	if err := Shutdown(); err != nil {
+		t.Fatalf("prepare Shutdown error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = Shutdown()
+	})
 }
