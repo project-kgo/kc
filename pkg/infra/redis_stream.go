@@ -889,6 +889,9 @@ func (m *redisStreamMQ) subscriptionConfig(options ...coremq.SubscribeOption) (r
 	if err != nil {
 		return redisStreamRuntimeConfig{}, err
 	}
+	if resolved.Kafka != nil {
+		return redisStreamRuntimeConfig{}, fmt.Errorf("%w: kafka option on redis stream", coremq.ErrUnsupportedSubscribeOption)
+	}
 
 	// 每次订阅复制一份运行配置，避免不同订阅之间互相污染。
 	config := m.config

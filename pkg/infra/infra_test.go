@@ -3,6 +3,7 @@ package infra
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -120,6 +121,48 @@ func TestInitRegistersRedisStreamMQWithoutNetworkCheck(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := cluster.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInitRegistersKafkaMQModesWithoutNetworkCheck(t *testing.T) {
+	suffix := time.Now().UnixNano()
+	consumerName := fmt.Sprintf("infra-test-kafka-consumer-%d", suffix)
+	shareName := fmt.Sprintf("infra-test-kafka-share-%d", suffix)
+	config := Config{MQ: map[string]MQConfig{
+		consumerName: {
+			Type: MQTypeKafka, SkipCheck: true,
+			Kafka: &KafkaConfig{Brokers: []string{"127.0.0.1:9092"}, MaxRetries: 2},
+		},
+		shareName: {
+			Type: MQTypeKafkaShare, SkipCheck: true,
+			Kafka: &KafkaConfig{Brokers: []string{"127.0.0.1:9092"}, MaxDeliveryAttempts: 4},
+		},
+	}}
+	if err := Init(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+
+	consumer := mustResource[MQ](t, consumerName)
+	share := mustResource[MQ](t, shareName)
+	consumerMQ, ok := consumer.(*kafkaMQ)
+	if !ok {
+		t.Fatalf("consumer MQ = %T", consumer)
+	}
+	if consumerMQ.mode != kafkaConsumerGroup {
+		t.Fatalf("consumer mode = %v", consumerMQ.mode)
+	}
+	shareMQ, ok := share.(*kafkaMQ)
+	if !ok {
+		t.Fatalf("share MQ = %T", share)
+	}
+	if shareMQ.mode != kafkaShareGroup {
+		t.Fatalf("share mode = %v", shareMQ.mode)
+	}
+	if err := consumer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := share.Close(); err != nil {
 		t.Fatal(err)
 	}
 }

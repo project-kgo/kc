@@ -12,6 +12,8 @@ func TestResolveSubscribeOptions(t *testing.T) {
 		WithBatchSize(32),
 		WithConcurrency(4),
 		WithRetryBackoff(100*time.Millisecond, 3*time.Second),
+		WithKafkaMaxRetries(3),
+		WithKafkaShareMaxDeliveryAttempts(4),
 		WithRedisStreamQueueDepth(128),
 		WithRedisStreamRedelivery(time.Minute, 10*time.Second),
 		WithRedisStreamAckBatch(64, 2*time.Millisecond),
@@ -26,6 +28,9 @@ func TestResolveSubscribeOptions(t *testing.T) {
 	}
 	if options.RetryBackoff.Min != 100*time.Millisecond || options.RetryBackoff.Max != 3*time.Second {
 		t.Fatalf("retry backoff = %+v", options.RetryBackoff)
+	}
+	if *options.Kafka.MaxRetries != 3 || *options.Kafka.MaxDeliveryAttempts != 4 {
+		t.Fatalf("kafka options = %+v", options.Kafka)
 	}
 	if *options.RedisStream.QueueDepth != 128 || *options.RedisStream.PendingIdleTimeout != time.Minute || *options.RedisStream.RedeliverInterval != 10*time.Second {
 		t.Fatalf("redis stream options = %+v", options.RedisStream)
@@ -58,6 +63,8 @@ func TestResolveSubscribeOptionsRejectsInvalidValues(t *testing.T) {
 		{name: "concurrency", option: WithConcurrency(-1)},
 		{name: "retry minimum", option: WithRetryBackoff(0, time.Second)},
 		{name: "retry order", option: WithRetryBackoff(time.Second, time.Millisecond)},
+		{name: "kafka max retries", option: WithKafkaMaxRetries(-1)},
+		{name: "kafka share attempts", option: WithKafkaShareMaxDeliveryAttempts(0)},
 		{name: "queue depth", option: WithRedisStreamQueueDepth(0)},
 		{name: "pending idle", option: WithRedisStreamPendingIdleTimeout(0)},
 		{name: "redeliver interval", option: WithRedisStreamRedeliverInterval(0)},

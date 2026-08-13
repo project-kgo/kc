@@ -25,8 +25,19 @@ const (
 type MQType string
 
 const (
+	MQTypeKafka              MQType = "kafka"
+	MQTypeKafkaShare         MQType = "kafka-share"
 	MQTypeRedisStream        MQType = "redis-stream"
 	MQTypeRedisStreamCluster MQType = "redis-stream-cluster"
+)
+
+// SASLMechanism 表示 Kafka 使用的 SASL 认证机制。
+type SASLMechanism string
+
+const (
+	SASLPlain       SASLMechanism = "plain"
+	SASLSCRAMSHA256 SASLMechanism = "scram-sha-256"
+	SASLSCRAMSHA512 SASLMechanism = "scram-sha-512"
 )
 
 var (
@@ -64,6 +75,7 @@ type MQConfig struct {
 	SkipCheck    bool          `json:"skip_check,omitempty" yaml:"skip_check,omitempty"`
 	CheckTimeout time.Duration `json:"check_timeout,omitempty" yaml:"check_timeout,omitempty"`
 
+	Kafka       *KafkaConfig       `json:"kafka,omitempty" yaml:"kafka,omitempty"`
 	Redis       *RedisConfig       `json:"redis,omitempty" yaml:"redis,omitempty"`
 	RedisStream *RedisStreamConfig `json:"redis_stream,omitempty" yaml:"redis_stream,omitempty"`
 }
@@ -105,6 +117,43 @@ type ElasticsearchConfig struct {
 	CertificateFingerprint string   `json:"certificate_fingerprint,omitempty" yaml:"certificate_fingerprint,omitempty"`
 	EnableCompression      bool     `json:"enable_compression,omitempty" yaml:"enable_compression,omitempty"`
 	DiscoverNodesOnStart   bool     `json:"discover_nodes_on_start,omitempty" yaml:"discover_nodes_on_start,omitempty"`
+}
+
+// KafkaConfig 配置 Kafka broker、认证、消费并发和失败重试策略。
+// MaxRetries 仅用于传统 consumer group，表示首次失败后的额外原地重试次数。
+// MaxDeliveryAttempts 仅用于 share group，包含首次投递；零值默认为 4，上限为 4。
+// 部署时 broker 的 group.share.delivery.count.limit 应配置为 5。
+type KafkaConfig struct {
+	Brokers     []string      `json:"brokers,omitempty" yaml:"brokers,omitempty"`
+	ClientID    string        `json:"client_id,omitempty" yaml:"client_id,omitempty"`
+	DialTimeout time.Duration `json:"dial_timeout,omitempty" yaml:"dial_timeout,omitempty"`
+	TLS         bool          `json:"tls,omitempty" yaml:"tls,omitempty"`
+	SASL        *SASLConfig   `json:"sasl,omitempty" yaml:"sasl,omitempty"`
+
+	// ConsumerBatchSize 和 Concurrency 的零值分别默认为 100 和 10。
+	ConsumerBatchSize int `json:"consumer_batch_size,omitempty" yaml:"consumer_batch_size,omitempty"`
+	Concurrency       int `json:"concurrency,omitempty" yaml:"concurrency,omitempty"`
+	// HandlerTimeout 的零值在传统组中为 30 秒，在 share group 中为 15 秒；
+	// share group 中应小于 broker 的 share.record.lock.duration.ms。
+	HandlerTimeout      time.Duration `json:"handler_timeout,omitempty" yaml:"handler_timeout,omitempty"`
+	MaxRetries          int           `json:"max_retries,omitempty" yaml:"max_retries,omitempty"`
+	MaxDeliveryAttempts int           `json:"max_delivery_attempts,omitempty" yaml:"max_delivery_attempts,omitempty"`
+	// BatchProcessingTimeout 和 RebalanceTimeout 仅用于传统组，零值分别默认为 45 秒和 60 秒。
+	// 前者限制一批消息从 Handler 到 DLQ 的总处理时间，必须小于后者。
+	BatchProcessingTimeout time.Duration `json:"batch_processing_timeout,omitempty" yaml:"batch_processing_timeout,omitempty"`
+	RebalanceTimeout       time.Duration `json:"rebalance_timeout,omitempty" yaml:"rebalance_timeout,omitempty"`
+	// RetryBackoff 和 RetryMaxBackoff 的零值分别默认为 1 秒和 30 秒。
+	RetryBackoff    time.Duration `json:"retry_backoff,omitempty" yaml:"retry_backoff,omitempty"`
+	RetryMaxBackoff time.Duration `json:"retry_max_backoff,omitempty" yaml:"retry_max_backoff,omitempty"`
+	// Logger 用于记录后台消费、重投、提交和 DLQ 异常；为空时使用 slog.Default()。
+	Logger *slog.Logger `json:"-" yaml:"-"`
+}
+
+// SASLConfig 配置 Kafka SASL 用户名、密码和认证机制。
+type SASLConfig struct {
+	Mechanism SASLMechanism `json:"mechanism" yaml:"mechanism"`
+	Username  string        `json:"username" yaml:"username"`
+	Password  string        `json:"password" yaml:"password"`
 }
 
 // RedisStreamConfig 配置 Redis 7.0+ Streams 的批量消费、并发、重试和裁剪策略。
@@ -193,7 +242,15 @@ func validateMQConfig(config MQConfig) error {
 		return fmt.Errorf("%w: check timeout is negative", ErrInvalidConfig)
 	}
 	switch config.Type {
+	case MQTypeKafka, MQTypeKafkaShare:
+		if config.DSN != "" || config.Redis != nil || config.RedisStream != nil {
+			return fmt.Errorf("%w: unexpected non-kafka config", ErrInvalidConfig)
+		}
+		return validateKafkaConfig(config)
 	case MQTypeRedisStream, MQTypeRedisStreamCluster:
+		if config.Kafka != nil {
+			return fmt.Errorf("%w: unexpected kafka config", ErrInvalidConfig)
+		}
 		return validateRedisStreamConfig(config)
 	default:
 		return fmt.Errorf("%w: mq %q", ErrUnsupportedType, config.Type)

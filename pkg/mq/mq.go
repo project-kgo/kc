@@ -16,6 +16,8 @@ var (
 
 // Message 描述一条与具体消息队列实现无关的消息。
 // ID 由消费端填充且应被视为不透明值；发布时不会使用该字段。
+// 消费端收到的 Key、Body 和 Headers value 仅保证在 Handler 调用期间有效，
+// 应视为只读；如需修改、异步使用或在 Handler 返回后持有，调用方必须自行复制。
 type Message struct {
 	ID        string
 	Key       []byte

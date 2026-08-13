@@ -124,6 +124,12 @@ func TestValidateConfigAcceptsDataAndMQTogether(t *testing.T) {
 			},
 		},
 		MQ: map[string]MQConfig{
+			"kafka-events": {
+				Type: MQTypeKafka, Kafka: &KafkaConfig{Brokers: []string{"localhost:9092"}},
+			},
+			"kafka-share-events": {
+				Type: MQTypeKafkaShare, Kafka: &KafkaConfig{Brokers: []string{"localhost:9092"}},
+			},
 			"redis-events": {
 				Type: MQTypeRedisStream, DSN: "redis://localhost:6379/0", RedisStream: &RedisStreamConfig{},
 			},

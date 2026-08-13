@@ -115,6 +115,8 @@ func prepareData(ctx context.Context, name string, config DataConfig) (preparedC
 
 func prepareMQ(ctx context.Context, name string, config MQConfig) (preparedClient, error) {
 	switch config.Type {
+	case MQTypeKafka, MQTypeKafkaShare:
+		return prepareKafka(ctx, name, config)
 	case MQTypeRedisStream, MQTypeRedisStreamCluster:
 		return prepareRedisStream(ctx, name, config)
 	default:

@@ -13,7 +13,7 @@ var (
 	ErrUnsupportedSubscribeOption = errors.New("mq: unsupported subscribe option")
 )
 
-// RetryBackoff 描述发生基础设施错误后的指数退避区间。
+// RetryBackoff 描述消息处理重试或基础设施恢复时的指数退避区间。
 type RetryBackoff struct {
 	Min time.Duration
 	Max time.Duration
@@ -30,6 +30,12 @@ type RedisStreamSubscribeOptions struct {
 	MaxDeliveryAttempts *int
 }
 
+// KafkaSubscribeOptions 包含仅适用于 Kafka 的订阅参数。
+type KafkaSubscribeOptions struct {
+	MaxRetries          *int
+	MaxDeliveryAttempts *int
+}
+
 // SubscribeOptions 是 SubscribeOption 解析后的覆盖配置。
 // 指针为 nil 表示沿用客户端初始化时的默认值。
 type SubscribeOptions struct {
@@ -37,6 +43,7 @@ type SubscribeOptions struct {
 	BatchSize      *int
 	Concurrency    *int
 	RetryBackoff   *RetryBackoff
+	Kafka          *KafkaSubscribeOptions
 	RedisStream    *RedisStreamSubscribeOptions
 }
 
@@ -102,7 +109,7 @@ func WithConcurrency(concurrency int) SubscribeOption {
 	})
 }
 
-// WithRetryBackoff 覆盖基础设施错误的指数退避区间。
+// WithRetryBackoff 覆盖消息处理重试或基础设施恢复时的指数退避区间。
 func WithRetryBackoff(minimum, maximum time.Duration) SubscribeOption {
 	return subscribeOptionFunc(func(options *SubscribeOptions) error {
 		if minimum <= 0 || maximum <= 0 {
@@ -112,6 +119,28 @@ func WithRetryBackoff(minimum, maximum time.Duration) SubscribeOption {
 			return fmt.Errorf("%w: retry max backoff is less than retry backoff", ErrInvalidSubscribeOption)
 		}
 		options.RetryBackoff = &RetryBackoff{Min: minimum, Max: maximum}
+		return nil
+	})
+}
+
+// WithKafkaMaxRetries 覆盖传统 consumer group 首次处理失败后的额外原地重试次数。
+func WithKafkaMaxRetries(retries int) SubscribeOption {
+	return subscribeOptionFunc(func(options *SubscribeOptions) error {
+		if retries < 0 {
+			return fmt.Errorf("%w: kafka max retries must not be negative", ErrInvalidSubscribeOption)
+		}
+		kafkaOptions(options).MaxRetries = intPointer(retries)
+		return nil
+	})
+}
+
+// WithKafkaShareMaxDeliveryAttempts 覆盖 share group 消息进入 DLQ 前的最大投递次数，包含首次投递，上限为 4。
+func WithKafkaShareMaxDeliveryAttempts(attempts int) SubscribeOption {
+	return subscribeOptionFunc(func(options *SubscribeOptions) error {
+		if attempts <= 0 {
+			return fmt.Errorf("%w: kafka share max delivery attempts must be positive", ErrInvalidSubscribeOption)
+		}
+		kafkaOptions(options).MaxDeliveryAttempts = intPointer(attempts)
 		return nil
 	})
 }
@@ -202,6 +231,13 @@ func redisOptions(options *SubscribeOptions) *RedisStreamSubscribeOptions {
 		options.RedisStream = &RedisStreamSubscribeOptions{}
 	}
 	return options.RedisStream
+}
+
+func kafkaOptions(options *SubscribeOptions) *KafkaSubscribeOptions {
+	if options.Kafka == nil {
+		options.Kafka = &KafkaSubscribeOptions{}
+	}
+	return options.Kafka
 }
 
 func intPointer(value int) *int {
