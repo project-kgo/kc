@@ -14,6 +14,7 @@ func TestResolveSubscribeOptions(t *testing.T) {
 		WithRetryBackoff(100*time.Millisecond, 3*time.Second),
 		WithKafkaMaxRetries(3),
 		WithKafkaShareMaxDeliveryAttempts(4),
+		WithKafkaStartOffset(KafkaStartOffsetEarliest),
 		WithRedisStreamQueueDepth(128),
 		WithRedisStreamRedelivery(time.Minute, 10*time.Second),
 		WithRedisStreamAckBatch(64, 2*time.Millisecond),
@@ -29,7 +30,8 @@ func TestResolveSubscribeOptions(t *testing.T) {
 	if options.RetryBackoff.Min != 100*time.Millisecond || options.RetryBackoff.Max != 3*time.Second {
 		t.Fatalf("retry backoff = %+v", options.RetryBackoff)
 	}
-	if *options.Kafka.MaxRetries != 3 || *options.Kafka.MaxDeliveryAttempts != 4 {
+	if *options.Kafka.MaxRetries != 3 || *options.Kafka.MaxDeliveryAttempts != 4 ||
+		*options.Kafka.StartOffset != KafkaStartOffsetEarliest {
 		t.Fatalf("kafka options = %+v", options.Kafka)
 	}
 	if *options.RedisStream.QueueDepth != 128 || *options.RedisStream.PendingIdleTimeout != time.Minute || *options.RedisStream.RedeliverInterval != 10*time.Second {
@@ -42,12 +44,20 @@ func TestResolveSubscribeOptions(t *testing.T) {
 }
 
 func TestResolveSubscribeOptionsLastWins(t *testing.T) {
-	options, err := ResolveSubscribeOptions(WithConcurrency(1), WithConcurrency(8))
+	options, err := ResolveSubscribeOptions(
+		WithConcurrency(1),
+		WithConcurrency(8),
+		WithKafkaStartOffset(KafkaStartOffsetEarliest),
+		WithKafkaStartOffset(KafkaStartOffsetLatest),
+	)
 	if err != nil {
 		t.Fatalf("ResolveSubscribeOptions() error = %v", err)
 	}
 	if got := *options.Concurrency; got != 8 {
 		t.Fatalf("Concurrency = %d, want 8", got)
+	}
+	if got := *options.Kafka.StartOffset; got != KafkaStartOffsetLatest {
+		t.Fatalf("Kafka.StartOffset = %q, want %q", got, KafkaStartOffsetLatest)
 	}
 }
 
@@ -65,6 +75,7 @@ func TestResolveSubscribeOptionsRejectsInvalidValues(t *testing.T) {
 		{name: "retry order", option: WithRetryBackoff(time.Second, time.Millisecond)},
 		{name: "kafka max retries", option: WithKafkaMaxRetries(-1)},
 		{name: "kafka share attempts", option: WithKafkaShareMaxDeliveryAttempts(0)},
+		{name: "kafka start offset", option: WithKafkaStartOffset("middle")},
 		{name: "queue depth", option: WithRedisStreamQueueDepth(0)},
 		{name: "pending idle", option: WithRedisStreamPendingIdleTimeout(0)},
 		{name: "redeliver interval", option: WithRedisStreamRedeliverInterval(0)},

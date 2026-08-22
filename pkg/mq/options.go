@@ -19,6 +19,14 @@ type RetryBackoff struct {
 	Max time.Duration
 }
 
+// KafkaStartOffset 表示传统 consumer group 没有已保存 offset 时的起始位置。
+type KafkaStartOffset string
+
+const (
+	KafkaStartOffsetEarliest KafkaStartOffset = "earliest"
+	KafkaStartOffsetLatest   KafkaStartOffset = "latest"
+)
+
 // RedisStreamSubscribeOptions 包含仅适用于 Redis Streams 的订阅参数。
 type RedisStreamSubscribeOptions struct {
 	QueueDepth          *int
@@ -34,6 +42,7 @@ type RedisStreamSubscribeOptions struct {
 type KafkaSubscribeOptions struct {
 	MaxRetries          *int
 	MaxDeliveryAttempts *int
+	StartOffset         *KafkaStartOffset
 }
 
 // SubscribeOptions 是 SubscribeOption 解析后的覆盖配置。
@@ -142,6 +151,20 @@ func WithKafkaShareMaxDeliveryAttempts(attempts int) SubscribeOption {
 		}
 		kafkaOptions(options).MaxDeliveryAttempts = intPointer(attempts)
 		return nil
+	})
+}
+
+// WithKafkaStartOffset 设置传统 consumer group 没有已保存 offset 时从最早或最新位置开始消费。
+func WithKafkaStartOffset(offset KafkaStartOffset) SubscribeOption {
+	return subscribeOptionFunc(func(options *SubscribeOptions) error {
+		switch offset {
+		case KafkaStartOffsetEarliest, KafkaStartOffsetLatest:
+			value := offset
+			kafkaOptions(options).StartOffset = &value
+			return nil
+		default:
+			return fmt.Errorf("%w: unsupported kafka start offset %q", ErrInvalidSubscribeOption, offset)
+		}
 	})
 }
 

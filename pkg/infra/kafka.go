@@ -85,6 +85,7 @@ type kafkaSubscriptionConfig struct {
 	kafkaRuntimeConfig
 	mode            kafkaGroupMode
 	batchController *kafkaBatchController
+	startOffset     *coremq.KafkaStartOffset
 }
 
 // kafkaBatchController 只中断 rebalance 当前阻塞的批次，不参与 MQ Close 的优雅关闭。
@@ -748,6 +749,12 @@ func (m *kafkaMQ) subscriptionConfig(options ...coremq.SubscribeOption) (kafkaSu
 		config.retryMaxBackoff = resolved.RetryBackoff.Max
 	}
 	if resolved.Kafka != nil {
+		if resolved.Kafka.StartOffset != nil {
+			if m.mode != kafkaConsumerGroup {
+				return kafkaSubscriptionConfig{}, fmt.Errorf("%w: start offset option on kafka share", coremq.ErrUnsupportedSubscribeOption)
+			}
+			config.startOffset = resolved.Kafka.StartOffset
+		}
 		if resolved.Kafka.MaxRetries != nil {
 			if m.mode != kafkaConsumerGroup {
 				return kafkaSubscriptionConfig{}, fmt.Errorf("%w: traditional retry option on kafka share", coremq.ErrUnsupportedSubscribeOption)
@@ -857,6 +864,10 @@ func prepareKafka(ctx context.Context, name string, config MQConfig) (preparedCl
 				}),
 			)
 		} else {
+			if subscriptionConfig.startOffset != nil {
+				offset := kafkaOffset(*subscriptionConfig.startOffset)
+				options = append(options, kgo.ConsumeStartOffset(offset), kgo.ConsumeResetOffset(offset))
+			}
 			options = append(options,
 				kgo.ConsumerGroup(group),
 				kgo.DisableAutoCommit(),
@@ -878,6 +889,13 @@ func prepareKafka(ctx context.Context, name string, config MQConfig) (preparedCl
 		commit: func() error { return resource.Set[coremq.MQ](name, mq) },
 		close:  func(context.Context) error { return mq.Close() },
 	}, nil
+}
+
+func kafkaOffset(start coremq.KafkaStartOffset) kgo.Offset {
+	if start == coremq.KafkaStartOffsetEarliest {
+		return kgo.NewOffset().AtStart()
+	}
+	return kgo.NewOffset().AtEnd()
 }
 
 func kafkaRuntimeConfigFrom(config *KafkaConfig, mode kafkaGroupMode) kafkaRuntimeConfig {
