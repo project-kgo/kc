@@ -24,8 +24,15 @@ const (
 	defaultSafetyThreshold  = 10 * time.Second
 	defaultCloseTimeout     = 5 * time.Second
 	maxStartupClockRollback = 5 * time.Second
-	workerAllocationRetries = 3
+	workerAllocationRetries = 8
+	allocationRetryBase     = 10 * time.Millisecond
+	allocationRetryMax      = 250 * time.Millisecond
 	maxIdentifierLength     = 63
+
+	coordinatorWorkerID   int64 = -1
+	coordinatorUpdatedAt  int64 = 1<<63 - 1
+	coordinatorIPAddress        = "metadata"
+	coordinatorLeaseToken       = "snowflake-coordinator-v1"
 )
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
@@ -44,8 +51,11 @@ type allocation struct {
 }
 
 type storage struct {
-	db    *sqlx.DB
-	table string
+	db         *sqlx.DB
+	driverName string
+	namespace  string
+	tableName  string
+	table      string
 }
 
 func resolveConfig(config Config, now time.Time) (resolvedConfig, error) {
@@ -93,49 +103,40 @@ func validateIdentifier(field, value string) error {
 	return nil
 }
 
-func newStorage(db *sqlx.DB, table string) (*storage, error) {
+func newStorage(db *sqlx.DB, config resolvedConfig) (*storage, error) {
 	if db == nil {
 		return nil, fmt.Errorf("%w: database is nil", ErrInvalidConfig)
 	}
-	switch db.DriverName() {
+	driverName := db.DriverName()
+	switch driverName {
 	case "mysql", "pgx":
 	default:
-		return nil, fmt.Errorf("%w: SQL driver %q is not supported", ErrInvalidConfig, db.DriverName())
+		return nil, fmt.Errorf("%w: SQL driver %q is not supported", ErrInvalidConfig, driverName)
 	}
-	return &storage{db: db, table: table}, nil
+	metadataNamespace := config.namespace
+	metadataTableName := config.tableName
+	if driverName == "pgx" {
+		// PostgreSQL 未加引号的标识符会统一折叠为小写。
+		metadataNamespace = strings.ToLower(metadataNamespace)
+		metadataTableName = strings.ToLower(metadataTableName)
+	}
+	return &storage{
+		db:         db,
+		driverName: driverName,
+		namespace:  metadataNamespace,
+		tableName:  metadataTableName,
+		table:      config.table,
+	}, nil
 }
 
 func (s *storage) rebind(query string) string {
 	return s.db.Rebind(query)
 }
 
-func (s *storage) ensureTable(ctx context.Context) error {
-	query := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-		worker_id INTEGER NOT NULL PRIMARY KEY,
-		last_timestamp BIGINT NOT NULL,
-		ip_address VARCHAR(45) NOT NULL,
-		updated_at BIGINT NOT NULL,
-		lease_token VARCHAR(64) NOT NULL
-	)`, s.table)
-	if _, err := s.db.ExecContext(ctx, query); err != nil {
-		return fmt.Errorf("create worker table: %w", err)
-	}
-
-	// CREATE TABLE IF NOT EXISTS 不会校验既有表结构，这里提前给出明确错误。
-	checkQuery := fmt.Sprintf(
-		"SELECT worker_id, last_timestamp, ip_address, updated_at, lease_token FROM %s WHERE 1 = 0",
-		s.table,
-	)
-	if _, err := s.db.ExecContext(ctx, checkQuery); err != nil {
-		return fmt.Errorf("validate worker table: %w", err)
-	}
-	return nil
-}
-
-func (s *storage) allocateWorker(ctx context.Context) (allocation, error) {
+func (s *storage) allocateWorker(ctx context.Context, epoch int64) (allocation, error) {
 	var lastErr error
 	for attempt := 0; attempt < workerAllocationRetries; attempt++ {
-		allocated, retry, err := s.allocateWorkerOnce(ctx)
+		allocated, retry, err := s.allocateWorkerOnce(ctx, epoch)
 		if err == nil {
 			return allocated, nil
 		}
@@ -143,11 +144,32 @@ func (s *storage) allocateWorker(ctx context.Context) (allocation, error) {
 		if !retry && !isRetryableTransaction(err) {
 			return allocation{}, err
 		}
+		if attempt == workerAllocationRetries-1 {
+			break
+		}
+		if err := waitAllocationRetry(ctx, attempt); err != nil {
+			return allocation{}, err
+		}
 	}
 	return allocation{}, fmt.Errorf("allocate worker after %d attempts: %w", workerAllocationRetries, lastErr)
 }
 
-func (s *storage) allocateWorkerOnce(ctx context.Context) (allocated allocation, retry bool, err error) {
+func waitAllocationRetry(ctx context.Context, attempt int) error {
+	delay := allocationRetryBase << attempt
+	if delay > allocationRetryMax {
+		delay = allocationRetryMax
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (s *storage) allocateWorkerOnce(ctx context.Context, epoch int64) (allocated allocation, retry bool, err error) {
 	tx, err := s.db.BeginTxx(ctx, nil)
 	if err != nil {
 		return allocation{}, false, fmt.Errorf("begin worker allocation: %w", err)
@@ -158,7 +180,13 @@ func (s *storage) allocateWorkerOnce(ctx context.Context) (allocated allocation,
 		}
 	}()
 
-	now := time.Now()
+	if err = s.lockCoordinator(ctx, tx, epoch); err != nil {
+		return allocation{}, false, err
+	}
+	databaseNow, err := s.databaseNow(ctx, tx)
+	if err != nil {
+		return allocation{}, false, err
+	}
 	leaseToken, err := newLeaseToken()
 	if err != nil {
 		return allocation{}, false, err
@@ -172,85 +200,144 @@ func (s *storage) allocateWorkerOnce(ctx context.Context) (allocated allocation,
 
 	var workerID, workerTimestamp int64
 	reclaimQuery := s.rebind(fmt.Sprintf(
-		"SELECT worker_id, last_timestamp FROM %s WHERE updated_at < ? ORDER BY updated_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED",
+		"SELECT worker_id, last_timestamp FROM %s WHERE worker_id BETWEEN ? AND ? AND updated_at < ? ORDER BY updated_at ASC LIMIT 1 FOR UPDATE",
 		s.table,
 	))
-	err = tx.QueryRowxContext(ctx, reclaimQuery, now.Add(-defaultWorkerTimeout).UnixMilli()).Scan(&workerID, &workerTimestamp)
+	err = tx.QueryRowxContext(
+		ctx,
+		reclaimQuery,
+		int64(0),
+		MaxWorkerID,
+		databaseNow-defaultWorkerTimeout.Milliseconds(),
+	).Scan(&workerID, &workerTimestamp)
 	if err == nil {
+		barrierTimestamp := max(workerTimestamp, globalTimestamp, databaseNow)
 		updateQuery := s.rebind(fmt.Sprintf(
 			"UPDATE %s SET last_timestamp = ?, ip_address = ?, updated_at = ?, lease_token = ? WHERE worker_id = ?",
 			s.table,
 		))
-		if _, err = tx.ExecContext(ctx, updateQuery, now.UnixMilli(), ipAddress, now.UnixMilli(), leaseToken, workerID); err != nil {
+		if _, err = tx.ExecContext(ctx, updateQuery, barrierTimestamp, ipAddress, databaseNow, leaseToken, workerID); err != nil {
 			return allocation{}, false, fmt.Errorf("reclaim worker %d: %w", workerID, err)
 		}
 		if err = tx.Commit(); err != nil {
-			return allocation{}, false, fmt.Errorf("commit reclaimed worker %d: %w", workerID, err)
+			return allocation{}, isDuplicateKey(err), fmt.Errorf("commit reclaimed worker %d: %w", workerID, err)
 		}
-		return allocation{
-			workerID:      workerID,
-			lastTimestamp: max(workerTimestamp, globalTimestamp),
-			leaseToken:    leaseToken,
-		}, false, nil
+		return allocation{workerID: workerID, lastTimestamp: barrierTimestamp, leaseToken: leaseToken}, false, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return allocation{}, false, fmt.Errorf("find expired worker: %w", err)
 	}
 
-	var maximumWorkerID int64
-	maxWorkerQuery := fmt.Sprintf("SELECT worker_id FROM %s ORDER BY worker_id DESC LIMIT 1 FOR UPDATE", s.table)
-	err = tx.QueryRowxContext(ctx, maxWorkerQuery).Scan(&maximumWorkerID)
-	nextWorkerID := int64(0)
-	switch {
-	case err == nil:
-		nextWorkerID = maximumWorkerID + 1
-	case errors.Is(err, sql.ErrNoRows):
-		// 空表从 worker 0 开始分配。
-	default:
-		return allocation{}, false, fmt.Errorf("find maximum worker ID: %w", err)
+	nextWorkerID, err := s.findAvailableWorkerID(ctx, tx)
+	if err != nil {
+		return allocation{}, false, err
 	}
-	if nextWorkerID > MaxWorkerID {
-		return allocation{}, false, ErrNoWorkerID
-	}
-
+	barrierTimestamp := max(globalTimestamp, databaseNow)
 	insertQuery := s.rebind(fmt.Sprintf(
 		"INSERT INTO %s (worker_id, last_timestamp, ip_address, updated_at, lease_token) VALUES (?, ?, ?, ?, ?)",
 		s.table,
 	))
-	if _, err = tx.ExecContext(ctx, insertQuery, nextWorkerID, now.UnixMilli(), ipAddress, now.UnixMilli(), leaseToken); err != nil {
+	if _, err = tx.ExecContext(ctx, insertQuery, nextWorkerID, barrierTimestamp, ipAddress, databaseNow, leaseToken); err != nil {
 		if isDuplicateKey(err) {
 			return allocation{}, true, fmt.Errorf("worker %d was allocated concurrently: %w", nextWorkerID, err)
 		}
 		return allocation{}, false, fmt.Errorf("insert worker %d: %w", nextWorkerID, err)
 	}
 	if err = tx.Commit(); err != nil {
-		if isDuplicateKey(err) {
-			return allocation{}, true, fmt.Errorf("worker %d was allocated concurrently: %w", nextWorkerID, err)
-		}
-		return allocation{}, false, fmt.Errorf("commit worker %d: %w", nextWorkerID, err)
+		return allocation{}, isDuplicateKey(err), fmt.Errorf("commit worker %d: %w", nextWorkerID, err)
 	}
-	return allocation{workerID: nextWorkerID, lastTimestamp: globalTimestamp, leaseToken: leaseToken}, false, nil
+	return allocation{workerID: nextWorkerID, lastTimestamp: barrierTimestamp, leaseToken: leaseToken}, false, nil
+}
+
+func (s *storage) lockCoordinator(ctx context.Context, tx *sqlx.Tx, epoch int64) error {
+	query := s.rebind(fmt.Sprintf(
+		"SELECT last_timestamp, lease_token FROM %s WHERE worker_id = ? FOR UPDATE",
+		s.table,
+	))
+	var storedEpoch int64
+	var leaseToken string
+	if err := tx.QueryRowxContext(ctx, query, coordinatorWorkerID).Scan(&storedEpoch, &leaseToken); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: coordinator row is missing", ErrInvalidConfig)
+		}
+		return fmt.Errorf("lock coordinator row: %w", err)
+	}
+	if leaseToken != coordinatorLeaseToken {
+		return fmt.Errorf("%w: worker ID %d is reserved for snowflake metadata", ErrInvalidConfig, coordinatorWorkerID)
+	}
+	if storedEpoch != epoch {
+		return fmt.Errorf("%w: configured epoch %d does not match stored epoch %d", ErrInvalidConfig, epoch, storedEpoch)
+	}
+	return nil
+}
+
+func (s *storage) findAvailableWorkerID(ctx context.Context, tx *sqlx.Tx) (int64, error) {
+	query := s.rebind(fmt.Sprintf(
+		"SELECT worker_id FROM %s WHERE worker_id BETWEEN ? AND ? ORDER BY worker_id ASC",
+		s.table,
+	))
+	rows, err := tx.QueryxContext(ctx, query, int64(0), MaxWorkerID)
+	if err != nil {
+		return 0, fmt.Errorf("list allocated worker IDs: %w", err)
+	}
+	defer rows.Close()
+
+	nextWorkerID := int64(0)
+	for rows.Next() {
+		var workerID int64
+		if err := rows.Scan(&workerID); err != nil {
+			return 0, fmt.Errorf("scan allocated worker ID: %w", err)
+		}
+		if workerID == nextWorkerID {
+			nextWorkerID++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate allocated worker IDs: %w", err)
+	}
+	if nextWorkerID > MaxWorkerID {
+		return 0, ErrNoWorkerID
+	}
+	return nextWorkerID, nil
 }
 
 func (s *storage) maxTimestamp(ctx context.Context, tx *sqlx.Tx) (int64, error) {
-	query := fmt.Sprintf("SELECT COALESCE(MAX(last_timestamp), 0) FROM %s", s.table)
+	query := s.rebind(fmt.Sprintf(
+		"SELECT COALESCE(MAX(last_timestamp), 0) FROM %s WHERE worker_id BETWEEN ? AND ?",
+		s.table,
+	))
 	var timestamp int64
-	if err := tx.QueryRowxContext(ctx, query).Scan(&timestamp); err != nil {
+	if err := tx.QueryRowxContext(ctx, query, int64(0), MaxWorkerID).Scan(&timestamp); err != nil {
 		return 0, fmt.Errorf("read maximum timestamp: %w", err)
 	}
 	return timestamp, nil
 }
 
-func (s *storage) heartbeat(ctx context.Context, workerID int64, leaseToken string, timestamp int64) error {
-	now := time.Now().UnixMilli()
-	if timestamp < now {
-		timestamp = now
+func (s *storage) databaseNow(ctx context.Context, tx *sqlx.Tx) (int64, error) {
+	var timestamp int64
+	if err := tx.QueryRowxContext(ctx, "SELECT "+s.databaseNowExpression()).Scan(&timestamp); err != nil {
+		return 0, fmt.Errorf("read database timestamp: %w", err)
 	}
+	return timestamp, nil
+}
+
+func (s *storage) databaseNowExpression() string {
+	if s.driverName == "pgx" {
+		return "FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT"
+	}
+	return "CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000 AS SIGNED)"
+}
+
+func (s *storage) heartbeat(ctx context.Context, workerID int64, leaseToken string, timestamp int64) error {
+	databaseNow := s.databaseNowExpression()
 	query := s.rebind(fmt.Sprintf(
-		"UPDATE %s SET last_timestamp = ?, updated_at = ? WHERE worker_id = ? AND lease_token = ?",
+		"UPDATE %s SET last_timestamp = GREATEST(last_timestamp, ?, %s), updated_at = %s WHERE worker_id BETWEEN 0 AND %d AND worker_id = ? AND lease_token = ?",
 		s.table,
+		databaseNow,
+		databaseNow,
+		MaxWorkerID,
 	))
-	result, err := s.db.ExecContext(ctx, query, timestamp, now, workerID, leaseToken)
+	result, err := s.db.ExecContext(ctx, query, timestamp, workerID, leaseToken)
 	if err != nil {
 		return fmt.Errorf("update worker heartbeat: %w", err)
 	}
@@ -265,13 +352,12 @@ func (s *storage) heartbeat(ctx context.Context, workerID int64, leaseToken stri
 }
 
 func (s *storage) release(ctx context.Context, workerID int64, leaseToken string, timestamp int64) error {
-	now := time.Now().UnixMilli()
-	if timestamp < now {
-		timestamp = now
-	}
+	databaseNow := s.databaseNowExpression()
 	query := s.rebind(fmt.Sprintf(
-		"UPDATE %s SET last_timestamp = ?, updated_at = 0 WHERE worker_id = ? AND lease_token = ?",
+		"UPDATE %s SET last_timestamp = GREATEST(last_timestamp, ?, %s), updated_at = 0 WHERE worker_id BETWEEN 0 AND %d AND worker_id = ? AND lease_token = ?",
 		s.table,
+		databaseNow,
+		MaxWorkerID,
 	))
 	if _, err := s.db.ExecContext(ctx, query, timestamp, workerID, leaseToken); err != nil {
 		return fmt.Errorf("release worker %d: %w", workerID, err)

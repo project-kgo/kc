@@ -59,7 +59,7 @@ type Snowflake struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 
-	lastHeartbeat atomic.Int64
+	lastHeartbeat atomic.Pointer[time.Time]
 	state         atomic.Uint32
 	closeOnce     sync.Once
 	closeErr      error
@@ -78,15 +78,15 @@ func New(ctx context.Context, db *sqlx.DB, config Config) (*Snowflake, error) {
 	if err != nil {
 		return nil, err
 	}
-	store, err := newStorage(db, resolved.table)
+	store, err := newStorage(db, resolved)
 	if err != nil {
 		return nil, err
 	}
-	if err := store.ensureTable(ctx); err != nil {
+	if err := store.ensureTable(ctx, resolved.epoch); err != nil {
 		return nil, fmt.Errorf("snowflake: ensure worker table %q: %w", resolved.table, err)
 	}
 
-	allocated, err := store.allocateWorker(ctx)
+	allocated, err := store.allocateWorker(ctx, resolved.epoch)
 	if err != nil {
 		return nil, fmt.Errorf("snowflake: allocate worker: %w", err)
 	}
@@ -111,7 +111,7 @@ func New(ctx context.Context, db *sqlx.DB, config Config) (*Snowflake, error) {
 		cancel:     cancel,
 		done:       make(chan struct{}),
 	}
-	generator.lastHeartbeat.Store(time.Now().UnixNano())
+	generator.recordHeartbeat(time.Now())
 	generator.state.Store(stateActive)
 	go generator.heartbeatLoop()
 	return generator, nil
@@ -143,8 +143,7 @@ func (s *Snowflake) Generate() (int64, error) {
 	if s.ctx.Err() != nil {
 		return 0, ErrClosed
 	}
-	last := time.Unix(0, s.lastHeartbeat.Load())
-	if time.Since(last) > defaultSafetyThreshold {
+	if s.heartbeatExpired(time.Now()) {
 		s.state.CompareAndSwap(stateActive, stateLeaseLost)
 		return 0, ErrLeaseLost
 	}
@@ -201,13 +200,15 @@ func (s *Snowflake) heartbeatLoop() {
 			return
 		case <-ticker.C:
 			if err := s.updateHeartbeat(); err != nil {
+				if s.ctx.Err() != nil {
+					return
+				}
 				if errors.Is(err, ErrLeaseLost) {
 					s.state.CompareAndSwap(stateActive, stateLeaseLost)
 					return
 				}
 				slog.Error("snowflake heartbeat failed", "worker_id", s.workerID, "error", err)
-				last := time.Unix(0, s.lastHeartbeat.Load())
-				if time.Since(last) > defaultSafetyThreshold {
+				if s.heartbeatExpired(time.Now()) {
 					s.state.CompareAndSwap(stateActive, stateLeaseLost)
 					return
 				}
@@ -220,27 +221,52 @@ func (s *Snowflake) updateHeartbeat() error {
 	if err := s.storage.heartbeat(s.ctx, s.workerID, s.leaseToken, s.node.latestTimestamp()); err != nil {
 		return err
 	}
-	s.lastHeartbeat.Store(time.Now().UnixNano())
+	s.recordHeartbeat(time.Now())
 	return nil
 }
 
 func waitForClock(ctx context.Context, lastTimestamp int64) error {
-	now := time.Now().UnixMilli()
-	if lastTimestamp <= now {
-		return nil
+	for {
+		wait, err := startupClockWait(time.Now().UnixMilli(), lastTimestamp)
+		if err != nil {
+			return err
+		}
+		if wait == 0 {
+			return nil
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+			// 系统时间可能在等待期间再次变化，必须重新确认已经越过时间屏障。
+		}
 	}
-	wait := time.Duration(lastTimestamp-now) * time.Millisecond
-	if wait > maxStartupClockRollback {
-		return fmt.Errorf("%w by %s", ErrClockBackwards, wait)
+}
+
+func startupClockWait(now, lastTimestamp int64) (time.Duration, error) {
+	if lastTimestamp < now {
+		return 0, nil
 	}
-	timer := time.NewTimer(wait + time.Millisecond)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
+	rollback := time.Duration(lastTimestamp-now) * time.Millisecond
+	if rollback > maxStartupClockRollback {
+		return 0, fmt.Errorf("%w by %s", ErrClockBackwards, rollback)
 	}
+	// 必须进入持久化时间戳的下一毫秒，避免复用 worker 后序列号从 0 重放。
+	return rollback + time.Millisecond, nil
+}
+
+func (s *Snowflake) recordHeartbeat(now time.Time) {
+	value := now
+	s.lastHeartbeat.Store(&value)
+}
+
+func (s *Snowflake) heartbeatExpired(now time.Time) bool {
+	last := s.lastHeartbeat.Load()
+	return last == nil || now.Sub(*last) > defaultSafetyThreshold
 }
 
 func releaseAllocation(store *storage, allocated allocation) error {

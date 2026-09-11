@@ -199,12 +199,43 @@ func TestGenerateRejectsClosedAndExpiredLease(t *testing.T) {
 	}
 
 	generator.state.Store(stateActive)
-	generator.lastHeartbeat.Store(time.Now().Add(-defaultSafetyThreshold - time.Second).UnixNano())
+	generator.recordHeartbeat(time.Now().Add(-defaultSafetyThreshold - time.Second))
 	if _, err := generator.Generate(); !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("expired Generate error = %v, want ErrLeaseLost", err)
 	}
 	if generator.state.Load() != stateLeaseLost {
 		t.Fatal("expired lease must transition to stateLeaseLost")
+	}
+}
+
+func TestStartupClockWaitRequiresNextMillisecond(t *testing.T) {
+	tests := []struct {
+		name          string
+		now           int64
+		lastTimestamp int64
+		want          time.Duration
+		wantError     error
+	}{
+		{name: "clock already ahead", now: 1001, lastTimestamp: 1000},
+		{name: "same millisecond", now: 1000, lastTimestamp: 1000, want: time.Millisecond},
+		{name: "clock behind", now: 1000, lastTimestamp: 1001, want: 2 * time.Millisecond},
+		{
+			name:          "rollback too large",
+			now:           1000,
+			lastTimestamp: 1000 + maxStartupClockRollback.Milliseconds() + 1,
+			wantError:     ErrClockBackwards,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			wait, err := startupClockWait(test.now, test.lastTimestamp)
+			if !errors.Is(err, test.wantError) {
+				t.Fatalf("startupClockWait error = %v, want %v", err, test.wantError)
+			}
+			if wait != test.want {
+				t.Fatalf("startupClockWait duration = %s, want %s", wait, test.want)
+			}
+		})
 	}
 }
 
