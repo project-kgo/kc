@@ -172,7 +172,8 @@ type RedisStreamConfig struct {
 	// MaxDeliveryAttempts 包含首次投递；达到上限后消息会进入 <topic>.dlq。
 	MaxDeliveryAttempts int `json:"max_delivery_attempts,omitempty" yaml:"max_delivery_attempts,omitempty"`
 	// ConsumerID 是 Redis consumer 名称的可选前缀，运行时总会追加唯一随机后缀。
-	ConsumerID         string        `json:"consumer_id,omitempty" yaml:"consumer_id,omitempty"`
+	ConsumerID string `json:"consumer_id,omitempty" yaml:"consumer_id,omitempty"`
+	// GroupStartID 是首次创建消费组时的起点，零值默认为 "$"，即只读之后的新消息；可设为 "0" 读取历史消息。
 	GroupStartID       string        `json:"group_start_id,omitempty" yaml:"group_start_id,omitempty"`
 	ReadBlock          time.Duration `json:"read_block,omitempty" yaml:"read_block,omitempty"`
 	HandlerTimeout     time.Duration `json:"handler_timeout,omitempty" yaml:"handler_timeout,omitempty"`

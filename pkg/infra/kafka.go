@@ -735,6 +735,11 @@ func (m *kafkaMQ) subscriptionConfig(options ...coremq.SubscribeOption) (kafkaSu
 	}
 
 	config := kafkaSubscriptionConfig{kafkaRuntimeConfig: m.config, mode: m.mode}
+	if m.mode == kafkaConsumerGroup {
+		// 新 consumer group 没有已提交 offset 时，默认只消费订阅后产生的消息。
+		startOffset := coremq.KafkaStartOffsetLatest
+		config.startOffset = &startOffset
+	}
 	if resolved.BatchSize != nil {
 		config.batchSize = *resolved.BatchSize
 	}

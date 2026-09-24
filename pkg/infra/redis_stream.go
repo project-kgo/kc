@@ -30,7 +30,7 @@ const (
 	defaultRedisStreamAckFlushInterval           = 2 * time.Millisecond
 	defaultRedisStreamReclaimMaxBatches          = 4
 	defaultRedisStreamMaxDeliveryAttempts        = 5
-	defaultRedisStreamGroupStartID               = "0"
+	defaultRedisStreamGroupStartID               = "$"
 	defaultRedisStreamReadBlock                  = time.Second
 	defaultRedisStreamHandlerTimeout             = 30 * time.Second
 	defaultRedisStreamPendingIdleTimeout         = time.Minute

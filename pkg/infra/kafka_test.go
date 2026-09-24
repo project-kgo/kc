@@ -361,11 +361,13 @@ func TestKafkaSubscriptionOptionsAreModeSpecific(t *testing.T) {
 	if _, err := share.subscriptionConfig(WithKafkaShareMaxDeliveryAttempts(5)); !errors.Is(err, ErrInvalidSubscribeOption) {
 		t.Fatalf("share attempts above broker-safe limit error = %v", err)
 	}
-	for _, mq := range []*kafkaMQ{traditional, share} {
-		defaults, err := mq.subscriptionConfig()
-		if err != nil || defaults.startOffset != nil {
-			t.Fatalf("default start offset = (%v, %v), want nil", defaults.startOffset, err)
-		}
+	defaults, err := traditional.subscriptionConfig()
+	if err != nil || defaults.startOffset == nil || *defaults.startOffset != KafkaStartOffsetLatest {
+		t.Fatalf("traditional default start offset = (%v, %v), want latest", defaults.startOffset, err)
+	}
+	defaults, err = share.subscriptionConfig()
+	if err != nil || defaults.startOffset != nil {
+		t.Fatalf("share default start offset = (%v, %v), want nil", defaults.startOffset, err)
 	}
 	resolved, err = traditional.subscriptionConfig(WithKafkaStartOffset(KafkaStartOffsetEarliest))
 	if err != nil || resolved.startOffset == nil || *resolved.startOffset != KafkaStartOffsetEarliest {

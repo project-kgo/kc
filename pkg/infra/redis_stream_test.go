@@ -1137,7 +1137,8 @@ func TestRedisStreamCancellationStopsErrorBackoff(t *testing.T) {
 
 func TestRedisStreamRuntimeDefaultsAndValidation(t *testing.T) {
 	config := redisStreamRuntimeConfigFrom(&RedisStreamConfig{})
-	if config.keyPrefix != "kc:mq" || config.batchSize != 64 || config.queueDepth != 64 || config.concurrency != 10 || config.maxLen != 0 {
+	if config.keyPrefix != "kc:mq" || config.batchSize != 64 || config.queueDepth != 64 || config.concurrency != 10 ||
+		config.groupStartID != "$" || config.maxLen != 0 {
 		t.Fatalf("runtime defaults = %#v", config)
 	}
 	if config.handlerTimeout != 30*time.Second || config.pendingIdleTimeout != time.Minute ||
