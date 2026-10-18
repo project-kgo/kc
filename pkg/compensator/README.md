@@ -1,6 +1,6 @@
 # 本地任务补偿 compensator
 
-`compensator` 让业务在自己的 PostgreSQL 事务里登记任务：首次就地执行回调，成功直接落为成功状态，不再进入轮询；失败或进程崩溃时由后台按指数退避在多个节点间补偿，直到成功或耗尽重试次数。只依赖业务现有的 `*sqlx.DB`（驱动 `pgx`，PostgreSQL 14+），不依赖 Redis 或服务发现。
+`compensator` 让业务在自己的 PostgreSQL 事务里登记任务，任务与业务数据一起提交或回滚。提交后由所有节点的后台 worker 共同领取执行，失败时按指数退避重试，直到成功或耗尽重试次数。只依赖业务现有的 `*sqlx.DB`（驱动 `pgx`，PostgreSQL 14+），不依赖 Redis 或服务发现。
 
 ## 快速开始
 
@@ -30,54 +30,44 @@ task, err := compensator.NewTask("order.paid", OrderPaid{OrderID: 42})
 if err != nil {
     return err
 }
-results, err := comp.Transaction(ctx, func(tx *compensator.Tx) error {
+err = comp.Transaction(ctx, func(tx *compensator.Tx) error {
     if _, err := tx.SQLTx().ExecContext(ctx, "UPDATE orders SET status = 'paid' WHERE id = $1", 42); err != nil {
         return err
     }
-    _, err := tx.Add(ctx, task)
+    _, err := tx.Add(ctx, task) // 返回任务 ID，可用 comp.Get 查询执行状态
     return err
 })
 if err != nil {
-    return err // 业务失败或提交失败，没有任何任务生效
-}
-for _, r := range results {
-    if r.Err != nil {
-        // 业务已提交，任务已登记为待重试，后台会补偿；不要因此重做业务。
-        logger.Warn("首次执行失败，等待补偿", "task_id", r.ID, "error", r.Err)
-    }
+    return err // 业务失败、登记失败或提交失败，没有任何任务生效
 }
 ```
 
 `Payload` 是 sonic 编码的 JSON 字符串：`NewTask` 用 `sonic.MarshalString` 编码，`Task.Decode` 用 `sonic.UnmarshalString` 解码。已编码的字符串可直接赋值 `Task{Type: "...", Payload: s}`。库中以 `TEXT` 原样保存，不做 JSON 校验或规范化。
 
-## 两种回调时机
+## 执行流程
 
-| 模式 | 流程 | 适用 |
-|---|---|---|
-| `ModeInTx`（默认） | 业务函数返回后、提交前执行回调，再用**一条多行 INSERT** 写入：成功的直接为 `succeeded`，失败的为 `pending` 等待补偿 | 回调成功即可结束，热路径只有 1 条 SQL |
-| `ModeAfterCommit` | 事务内写入 `running` 且由本进程持有租约的任务，提交后立即回调，再按令牌落库结果 | 回调必须看到已提交的业务数据，或不希望在事务内等待外部调用 |
+1. **登记**：`Transaction` / `AddTx` 在业务事务内把任务写为 `pending`，随业务一起提交或回滚。回调不会在事务内执行。
+2. **领取**：各节点的扫描循环用一条短语句领取到期任务：`FOR UPDATE SKIP LOCKED` 选出最早到期的行，改为 `running`，写入随机令牌，并把 `next_run_at` 设为租约到期时间（`LeaseDuration`）。语句提交后行锁即释放，回调在事务外执行。只领取空闲 worker 数量、且本节点注册了回调的类型的任务，领取后立即开始执行，不在本地排队。
+3. **落库**：回调结束后按令牌写回结果：成功为 `succeeded`；失败且有剩余次数为 `pending` 并按退避推迟 `next_run_at`；次数耗尽为 `failed`。令牌不匹配（租约已被接管）时旧结果不会覆盖新状态。
 
-`ModeInTx` 下回调发生在提交之前：如果随后 INSERT 或提交失败，回调已经产生的外部副作用无法撤销，因此回调必须幂等，并能容忍业务最终未提交。回调期间事务保持打开，回调应尽量快（受 `HandlerTimeout` 约束）。多个任务的首次回调并发执行。
+`Transaction` 提交后会唤醒本节点的扫描：本节点有空闲 worker 时任务立即被领取，延迟只多一次领取的往返；否则由任一节点在 `ScanInterval` 内领取。`AddTx` 由调用方提交，不唤醒扫描。
 
-`ModeAfterCommit` 下进程在提交后、回调前崩溃时，任务的租约（`LeaseDuration`）到期后由后台接管。
+`running` 的任务在租约到期前不会被其它节点领取。领取语句不随 `Close` 取消，避免语句已在服务端提交、结果却被丢弃，导致任务空等租约到期并白耗一次执行次数。回调受 `HandlerTimeout` 约束且 `LeaseDuration > HandlerTimeout`，正常执行总会在租约到期前落库；只有执行者崩溃或与数据库失联时，任务才会在租约到期后被其它节点接管。`Close` 会取消执行中的回调，并立即把它们归还为 `pending`，不消耗执行次数。
 
 ### 接入已有事务
 
 ```go
 tx, _ := db.BeginTxx(ctx, nil)
 // ... 业务写入
-result, err := comp.AddTx(ctx, tx, task) // ModeInTx：立即回调并写入
+id, err := comp.AddTx(ctx, tx, task)
 if err != nil {
     return err
 }
 if err := tx.Commit(); err != nil {
     return err
 }
-// ModeAfterCommit：提交成功后调用 Dispatch 立即执行；遗漏时租约到期由后台补偿。
-results, err := comp.Dispatch(ctx, result.ID)
+// 提交后任务由后台在 ScanInterval 内领取执行；回滚则任务不存在。
 ```
-
-`Dispatch` 也可用于立即执行已到期的待重试任务；正被其它执行者处理、未到期或已终态的任务不会重复执行，返回其当前状态。
 
 ## 配置
 
@@ -85,20 +75,18 @@ results, err := comp.Dispatch(ctx, result.ID)
 |---|---|---|
 | `TableSuffix` | 必填 | `[a-z0-9_]{1,40}` |
 | `Schema` | `current_schema()` | 必须已存在 |
-| `Mode` | `ModeInTx` | 见上节 |
-| `WorkerCount` | 8 | 后台补偿 worker 数（不限制前台首次回调） |
+| `WorkerCount` | 8 | 每个节点同时执行回调的 worker 数，决定执行并发上限（`WorkerCount × 节点数`） |
 | `ScanInterval` | 1s | 空闲扫描间隔；领取满批后立即继续 |
 | `BatchSize` | 2×WorkerCount | 单次领取上限，实际不超过空闲 worker 数 |
 | `MaxRetries` | 10 | 不含首次；`-1` 表示不重试 |
 | `RetryBackoffMin` / `RetryBackoffMax` | 1s / 5min | 指数退避，叠加 50%～100% 随机抖动 |
 | `HandlerTimeout` | 30s | 回调 context 超时；回调忽略超时返回 nil 也按失败处理 |
-| `LeaseDuration` | HandlerTimeout+10s | running 任务被其它节点接管前的期限，必须大于 `HandlerTimeout` |
+| `LeaseDuration` | HandlerTimeout+10s | running 任务被其它节点接管前的期限，必须大于 `HandlerTimeout`；也是执行者崩溃后任务重新可领取的等待时间 |
 | `CleanupAfter` | 5min | 成功记录保留时长 |
 | `CleanupInterval` / `CleanupBatchSize` | 30s / 1000 | 清理间隔与每批删除行数（每轮最多 100 批） |
 | `FailedRetention` | 0 | >0 时清理失败超过该时长的记录；默认保留，便于排查和 `Retry` |
-| `HeartbeatInterval` / `NodeTTL` | 3s / 15s | 节点与分片租约，`NodeTTL ≥ 3×HeartbeatInterval` |
 | `OperationTimeout` | 5s | 后台单次数据库操作超时 |
-| `DisableWorker` | false | 只登记和首次执行，不参与分片与补偿（如只写的批处理进程） |
+| `DisableWorker` | false | 只登记任务，不执行和清理（如只写的批处理进程） |
 | `Logger` | `slog.Default()` | 不记录载荷 |
 
 最多执行 `1 + MaxRetries` 次。进程在领取后崩溃同样消耗一次预算，防止毒任务导致无限崩溃循环。耗尽后状态为 `failed`，可调用 `Retry(ctx, id)` 重置预算（ID 不变）。
@@ -109,40 +97,45 @@ results, err := comp.Dispatch(ctx, result.ID)
 
 ```go
 type Metrics interface {
-    Executed(ExecEvent)                // 每次回调执行后：类型、来源、第几次、落库状态、耗时、错误
+    Executed(ExecEvent)                // 每次回调执行后：类型、第几次、落库状态、耗时、错误
     Cleaned(status Status, rows int64) // 每批清理后
-    ShardsOwned(owned int)             // 每次分片协调后本节点持有的分片数
 }
 ```
 
-`ExecEvent.Source` 区分 `first_run`（事务内首次）、`after_commit`、`dispatch`、`background`（补偿）。方法在执行路径上同步调用，实现必须并发安全且不阻塞（如 Prometheus counter/histogram）。
+方法在执行路径上同步调用，实现必须并发安全且不阻塞（如 Prometheus counter/histogram）。
 
 积压用 `Stats(ctx)` 低频采集（如每 30 秒），返回全表 pending/running/failed 数量和最早到期时间，适合做 gauge 并配置告警：`failed > 0`、`now - OldestDue` 持续增大（补偿跟不上）。多节点部署时只需一处采集。
 
 ## 表结构
 
-后缀 `orders` 创建两张表：
+后缀 `orders` 创建任务表 `compensator_orders`，主键为应用生成的 UUIDv7（登记时就有稳定 ID，时间有序利于 B-tree 追加）：
 
-- `compensator_orders`：任务主表，主键为应用生成的 UUIDv7（回调前就有稳定 ID，时间有序利于 B-tree 追加）。
-  - `compensator_orders_due_idx (shard_id, next_run_at) WHERE status < 2`：只包含待执行/执行中的任务，首次即成功的任务不进入，扫描始终很小。
-  - `compensator_orders_done_idx (shard_id, status, completed_at) WHERE status >= 2`：清理使用。
-- `compensator_orders_lease`：协调表，64 行分片（`kind=0`）加每个节点一行心跳（`kind=1`）。
+- `compensator_orders_due_idx (next_run_at) WHERE status < 2`：只包含待执行/执行中的任务，执行完成即移出，领取扫描始终很小。
+- `compensator_orders_done_idx (status, completed_at) WHERE status >= 2`：清理使用。
 
-多个节点并发启动时，建表在 `pg_advisory_xact_lock` 下串行执行，并校验列类型、索引和分片行。组件不做自动迁移，也不会覆盖已有表的存储参数。
+多个节点并发启动时，建表在 `pg_advisory_xact_lock` 下串行执行，并校验列类型和索引。组件不做自动迁移，也不会覆盖已有表的存储参数。
 
 ## 多节点
 
-任务插入时随机落入 64 个逻辑分片之一，之后不再搬迁。每个节点每个心跳周期：续约自己的心跳行、统计存活节点数 n，持有分片超过 `ceil(64/n)` 的主动释放，不足的用 `FOR UPDATE SKIP LOCKED` 随机抢占过期分片。各节点只扫描、清理自己持有的分片，互不竞争；节点失联后其分片在 `NodeTTL` 后被其它节点接管，`Close` 时主动释放以便立即接管。超过 64 个节点时部分节点没有分片（仍可登记和首次执行）。
+所有节点从同一张表领取任务，不需要分片、节点注册或选主。并发领取由 `FOR UPDATE SKIP LOCKED` 保证同一行只被一个节点拿到，各节点互不阻塞；节点上下线不需要任何协调，新节点下一次扫描就开始消费。清理同样由所有节点并发执行，候选行加 `FOR UPDATE SKIP LOCKED`，彼此删除不同的行。
 
-分片归属只用于划分负载，正确性不依赖它：领取使用 `FOR UPDATE SKIP LOCKED` 并写入随机令牌，结果落库必须匹配令牌，交接期间旧执行者的结果不会覆盖新状态。领取是一条语句：对持有的分片逐个走 `due_idx` 取到期任务，只领取空闲 worker 数量的任务，避免任务在本地排队导致租约过期。
+重复执行的防护：
+
+| 情形 | 防护 |
+|---|---|
+| 多个节点同时领取 | 行锁 + 随机令牌，同一时刻只有一个持有者 |
+| 执行中租约过期 | 只按空闲 worker 数领取、不在本地排队；`LeaseDuration > HandlerTimeout`，超时取消回调，回调超时后才返回成功也按失败处理 |
+| 旧执行者晚到的结果 | 落库校验令牌，不匹配则丢弃 |
+| 滚动发布新增任务类型 | 节点只领取自己注册了回调的类型，旧节点不会领取新类型后因缺少回调而失败 |
+| 回调成功后、结果落库前崩溃 | 无法避免，任务会再次执行 |
 
 所有时间判断使用数据库时钟，节点时钟漂移不影响租约。
 
-组件提供**至少一次**执行，不保证顺序：回调成功后在结果落库前崩溃，任务会再次执行。
+组件提供**至少一次**执行，不保证顺序：回调必须幂等，建议以 `task.ID` 作为下游幂等键。
 
 ## 空间回收与运维
 
-成功记录在 `CleanupAfter` 后由持有对应分片的节点按批 `DELETE`。任务表创建时带有以下参数，使删除产生的死元组被及时回收，堆页与索引页的空闲空间被后续写入复用，稳定负载下表大小保持平稳：
+成功记录在 `CleanupAfter` 后由各节点按批 `DELETE`。任务表创建时带有以下参数，使删除产生的死元组被及时回收，堆页与索引页的空闲空间被后续写入复用，稳定负载下表大小保持平稳：
 
 ```sql
 WITH (
@@ -192,4 +185,6 @@ TEST_POSTGRES_DSN='postgres://user:pass@127.0.0.1:5432/test?sslmode=disable' \
 TEST_POSTGRES_DSN='...' go test ./pkg/compensator -run '^$' -bench PostgreSQL -benchmem
 ```
 
-设置 `TEST_COMPENSATOR_LOG=1` 可输出集成测试中组件的日志。集成测试覆盖：并发建表与表参数、结构不兼容时拒绝启动、两种模式的首次执行、业务回滚、外部事务与 `Dispatch`、崩溃后租约接管、旧令牌无法覆盖、重试耗尽与 `Retry`、按保留期清理、三节点分片均衡与节点下线接管（每个任务恰好成功一次）、索引使用以及删除后空间复用。
+设置 `TEST_COMPENSATOR_LOG=1` 可输出集成测试中组件的日志。集成测试覆盖：并发建表与表参数、结构不兼容时拒绝启动、回调能看到已提交的业务数据、业务回滚、外部事务、慢回调下不因本地排队丢失租约、只领取已注册的类型、崩溃后租约接管、旧令牌无法覆盖、重试耗尽与 `Retry`、多节点并发清理、清理跳过重试中的任务、三节点并发消费与节点下线（每个任务恰好成功一次）、索引使用以及删除后空间复用。
+
+`BenchmarkPostgreSQLEndToEnd` 报告从登记到回调完成的 p50/p99 延迟、调用方 `Transaction` 耗时和吞吐，建议 `-benchtime=2000x`；`BenchmarkPostgreSQLBackground` 建议 `-benchtime=1x`。

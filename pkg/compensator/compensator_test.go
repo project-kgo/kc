@@ -21,7 +21,7 @@ func TestResolveConfigDefaults(t *testing.T) {
 	}
 	if c.WorkerCount != 8 || c.BatchSize != 16 || c.ScanInterval != time.Second || c.retries != 10 ||
 		c.HandlerTimeout != 30*time.Second || c.LeaseDuration != 40*time.Second || c.CleanupAfter != 5*time.Minute ||
-		c.CleanupBatchSize != 1000 || c.NodeTTL != 15*time.Second || c.Mode != ModeInTx || c.Logger == nil {
+		c.CleanupBatchSize != 1000 || c.OperationTimeout != 5*time.Second || c.Logger == nil {
 		t.Fatalf("unexpected defaults: %+v", c)
 	}
 	if c, err = resolveConfig(Config{TableSuffix: "x", MaxRetries: -1}); err != nil || c.retries != 0 {
@@ -38,10 +38,8 @@ func TestResolveConfigRejectsInvalid(t *testing.T) {
 		"negative workers":    {TableSuffix: "x", WorkerCount: -1},
 		"negative interval":   {TableSuffix: "x", ScanInterval: -time.Second},
 		"lease <= handler":    {TableSuffix: "x", HandlerTimeout: time.Second, LeaseDuration: time.Second},
-		"ttl < 3 heartbeats":  {TableSuffix: "x", HeartbeatInterval: time.Second, NodeTTL: 2 * time.Second},
 		"backoff max < min":   {TableSuffix: "x", RetryBackoffMin: time.Minute, RetryBackoffMax: time.Second},
 		"retries < -1":        {TableSuffix: "x", MaxRetries: -2},
-		"unknown mode":        {TableSuffix: "x", Mode: Mode(9)},
 		"negative failed ret": {TableSuffix: "x", FailedRetention: -1},
 	} {
 		if _, err := resolveConfig(c); !errors.Is(err, ErrInvalidConfig) {
@@ -116,9 +114,10 @@ func TestInvokeAndOutcome(t *testing.T) {
 
 // fakeStorage 是内存版存储，按与 SQL 相同的令牌语义领取和落库。
 type fakeStorage struct {
-	mu       sync.Mutex
-	tasks    map[uuid.UUID]*fakeRow
-	released atomic.Bool
+	mu    sync.Mutex
+	tasks map[uuid.UUID]*fakeRow
+	// beforeClaim 不为空时在每次领取前调用，用于在领取过程中注入事件。
+	beforeClaim func(ctx context.Context)
 }
 
 type fakeRow struct {
@@ -131,19 +130,29 @@ type fakeRow struct {
 func newFakeStorage() *fakeStorage { return &fakeStorage{tasks: make(map[uuid.UUID]*fakeRow)} }
 
 func (f *fakeStorage) add(n int) []uuid.UUID {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	tasks := make([]Task, n)
 	ids := make([]uuid.UUID, n)
-	for i := range ids {
+	for i := range tasks {
 		ids[i] = uuid.Must(uuid.NewV7())
-		f.tasks[ids[i]] = &fakeRow{task: Task{ID: ids[i], Type: "t"}, status: StatusPending}
+		tasks[i] = Task{ID: ids[i], Type: "t"}
 	}
+	_ = f.insert(context.Background(), nil, tasks)
 	return ids
 }
 
-func (f *fakeStorage) insert(context.Context, *sqlx.Tx, []newRow) error { return nil }
+func (f *fakeStorage) insert(_ context.Context, _ *sqlx.Tx, tasks []Task) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, t := range tasks {
+		f.tasks[t.ID] = &fakeRow{task: t, status: StatusPending}
+	}
+	return nil
+}
 
-func (f *fakeStorage) claim(_ context.Context, shards []int16, limit int, token int64) ([]claimed, error) {
+func (f *fakeStorage) claim(ctx context.Context, limit int, token int64) ([]claimed, error) {
+	if f.beforeClaim != nil {
+		f.beforeClaim(ctx)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []claimed
@@ -157,24 +166,6 @@ func (f *fakeStorage) claim(_ context.Context, shards []int16, limit int, token 
 			row.due = time.Now().Add(time.Minute)
 			out = append(out, claimed{Task: row.task, token: token})
 		}
-	}
-	return out, nil
-}
-
-func (f *fakeStorage) claimIDs(_ context.Context, ids []uuid.UUID, own, token int64) ([]claimed, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	var out []claimed
-	for _, id := range ids {
-		row := f.tasks[id]
-		if row == nil || row.status >= StatusSucceeded || (row.status == StatusRunning && row.token != own) {
-			continue
-		}
-		if row.token != own {
-			row.task.Attempt++
-		}
-		row.status, row.token = StatusRunning, token
-		out = append(out, claimed{Task: row.task, token: token})
 	}
 	return out, nil
 }
@@ -210,27 +201,13 @@ func (f *fakeStorage) get(_ context.Context, id uuid.UUID) (Record, error) {
 	return Record{Task: row.task, Status: row.status, Attempts: row.task.Attempt}, nil
 }
 
-func (f *fakeStorage) statuses(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]Status, error) {
-	result := map[uuid.UUID]Status{}
-	for _, id := range ids {
-		if r, err := f.get(ctx, id); err == nil {
-			result[id] = r.Status
-		}
-	}
-	return result, nil
-}
-
 func (f *fakeStorage) retry(context.Context, uuid.UUID) error { return nil }
-func (f *fakeStorage) cleanup(context.Context, []int16, Status, time.Duration, int) (int64, error) {
+func (f *fakeStorage) cleanup(context.Context, Status, time.Duration, int) (int64, error) {
 	return 0, nil
 }
 func (f *fakeStorage) stats(context.Context) (Stats, error) {
 	return Stats{Pending: int64(f.count(StatusPending)), Running: int64(f.count(StatusRunning)), Failed: int64(f.count(StatusFailed))}, nil
 }
-func (f *fakeStorage) coordinate(context.Context, string) ([]int16, error) {
-	return []int16{0, 1, 2}, nil
-}
-func (f *fakeStorage) release(context.Context, string) error { f.released.Store(true); return nil }
 
 func (f *fakeStorage) count(status Status) int {
 	f.mu.Lock()
@@ -247,28 +224,23 @@ func (f *fakeStorage) count(status Status) int {
 // recordingMetrics 统计收到的事件，用于验证指标钩子被调用。
 type recordingMetrics struct {
 	mu       sync.Mutex
-	executed map[Source]map[Status]int
-	shards   atomic.Int64
+	executed map[Status]int
 }
 
 func (m *recordingMetrics) Executed(e ExecEvent) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.executed == nil {
-		m.executed = map[Source]map[Status]int{}
+		m.executed = map[Status]int{}
 	}
-	if m.executed[e.Source] == nil {
-		m.executed[e.Source] = map[Status]int{}
-	}
-	m.executed[e.Source][e.Status]++
+	m.executed[e.Status]++
 }
 func (m *recordingMetrics) Cleaned(Status, int64) {}
-func (m *recordingMetrics) ShardsOwned(n int)     { m.shards.Store(int64(n)) }
 
-func (m *recordingMetrics) count(source Source, status Status) int {
+func (m *recordingMetrics) count(status Status) int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.executed[source][status]
+	return m.executed[status]
 }
 
 func testConfig(t *testing.T, c Config) resolvedConfig {
@@ -326,14 +298,11 @@ func TestBackgroundRespectsWorkerCount(t *testing.T) {
 	if peak.Load() > 4 {
 		t.Fatalf("concurrency %d exceeds worker count", peak.Load())
 	}
-	if !store.released.Load() {
-		t.Fatal("Close must release leases")
-	}
 	if len(c.slots) != 0 {
 		t.Fatalf("leaked %d slots", len(c.slots))
 	}
-	if metrics.count(SourceBackground, StatusPending) != 200 || metrics.count(SourceBackground, StatusSucceeded) != 200 || metrics.shards.Load() != 3 {
-		t.Fatalf("unexpected metrics: %+v shards=%d", metrics.executed, metrics.shards.Load())
+	if metrics.count(StatusPending) != 200 || metrics.count(StatusSucceeded) != 200 {
+		t.Fatalf("unexpected metrics: %+v", metrics.executed)
 	}
 }
 
@@ -370,29 +339,44 @@ func TestCloseAbandonsInterruptedTasks(t *testing.T) {
 	}
 }
 
-func TestDispatchSkipsTasksHeldByOthers(t *testing.T) {
+// Close 发生在领取过程中时领取不被取消，领到的任务由 worker 归还，不执行也不消耗次数。
+func TestCloseDuringClaimReturnsTasks(t *testing.T) {
 	store := newFakeStorage()
 	ids := store.add(2)
-	cfg := testConfig(t, Config{DisableWorker: true})
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	var claimCanceled atomic.Bool
+	store.beforeClaim = func(ctx context.Context) {
+		once.Do(func() {
+			close(entered)
+			<-release
+			claimCanceled.Store(ctx.Err() != nil)
+		})
+	}
 	var calls atomic.Int64
+	cfg := testConfig(t, Config{WorkerCount: 2, ScanInterval: time.Hour})
 	c, err := start(context.Background(), nil, store, cfg, map[string]Handler{"t": func(context.Context, *Task) error { calls.Add(1); return nil }})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
-	store.tasks[ids[1]].status, store.tasks[ids[1]].token = StatusRunning, 42
-	results, err := c.Dispatch(context.Background(), ids...)
-	if err != nil {
+	<-entered
+	closed := make(chan error)
+	go func() { closed <- c.Close() }()
+	waitFor(t, 5*time.Second, func() bool { return c.ctx.Err() != nil })
+	close(release)
+	if err = <-closed; err != nil {
 		t.Fatal(err)
 	}
-	if results[0].Status != StatusSucceeded || results[1].Status != StatusRunning || calls.Load() != 1 {
-		t.Fatalf("unexpected results %+v, calls %d", results, calls.Load())
+	if claimCanceled.Load() {
+		t.Fatal("claim must not be canceled by Close")
 	}
-	if st, err := c.Stats(context.Background()); err != nil || st.Running != 1 {
-		t.Fatalf("stats: %+v %v", st, err)
+	if calls.Load() != 0 {
+		t.Fatalf("tasks claimed during Close must not run, ran %d", calls.Load())
 	}
-	if _, err = c.Dispatch(context.Background(), ids[0], ids[0]); !errors.Is(err, ErrInvalidArgument) {
-		t.Fatalf("duplicate IDs: %v", err)
+	for _, id := range ids {
+		if r, _ := store.get(context.Background(), id); r.Status != StatusPending || r.Attempts != 0 {
+			t.Fatalf("task claimed during Close should be returned without consuming an attempt: %+v", r)
+		}
 	}
 }
 
@@ -421,31 +405,14 @@ func TestTxAddRejectsDuplicateIDs(t *testing.T) {
 	}
 }
 
-func TestParallelRespectsLimit(t *testing.T) {
-	c := &Compensator{config: resolvedConfig{Config: Config{WorkerCount: 3}}}
-	var running, peak atomic.Int64
-	var done atomic.Int64
-	c.parallel(50, func(int) {
-		n := running.Add(1)
-		for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
-		}
-		time.Sleep(time.Millisecond)
-		running.Add(-1)
-		done.Add(1)
-	})
-	if done.Load() != 50 || peak.Load() > 3 {
-		t.Fatalf("done=%d peak=%d", done.Load(), peak.Load())
-	}
-}
-
 func TestRunnableReportsExhausted(t *testing.T) {
 	metrics := &recordingMetrics{}
 	c := &Compensator{config: testConfig(t, Config{Metrics: metrics})}
 	tasks := []claimed{{Task: Task{ID: uuid.New()}}, {Task: Task{ID: uuid.New()}, exhausted: true}}
-	if got := c.runnable(tasks, SourceBackground); len(got) != 1 || got[0].ID != tasks[0].ID {
+	if got := c.runnable(tasks); len(got) != 1 || got[0].ID != tasks[0].ID {
 		t.Fatalf("runnable = %+v", got)
 	}
-	if metrics.count(SourceBackground, StatusFailed) != 1 {
+	if metrics.count(StatusFailed) != 1 {
 		t.Fatal("exhausted task must be reported")
 	}
 }

@@ -1,7 +1,7 @@
 // Package compensator 提供基于 PostgreSQL 的本地任务补偿组件。
 //
-// 业务在自己的事务中登记任务，组件首次就地执行回调：成功直接落为成功状态，
-// 失败或进程崩溃时由后台按退避策略在多个节点间补偿，直至成功或耗尽重试次数。
+// 业务在自己的事务中登记任务，提交后由所有节点的后台 worker 共同领取执行；
+// 失败或进程崩溃时按退避策略重试，直至成功或耗尽重试次数。
 package compensator
 
 import (
@@ -17,9 +17,6 @@ import (
 	"github.com/bytedance/sonic"
 	"github.com/google/uuid"
 )
-
-// shardCount 是固定的逻辑分片数，任务插入时随机落入其中之一，扩缩容不搬迁数据。
-const shardCount = 64
 
 var (
 	ErrInvalidConfig    = errors.New("compensator: invalid config")
@@ -58,16 +55,6 @@ func (s Status) String() string {
 	}
 }
 
-// Mode 决定首次回调发生在业务事务提交之前还是之后。
-type Mode int
-
-const (
-	// ModeInTx 在事务内先执行回调，再按结果一次写入成功或待重试状态。
-	ModeInTx Mode = iota
-	// ModeAfterCommit 在事务内写入持有租约的任务，提交后再执行回调并落库结果。
-	ModeAfterCommit
-)
-
 // Task 是交给回调的任务。ID 稳定不变，业务应以它实现幂等。
 type Task struct {
 	ID      uuid.UUID
@@ -103,7 +90,6 @@ func (t *Task) Decode(dst any) error {
 // Record 是任务的完整持久化状态，时间均来自数据库时钟。
 type Record struct {
 	Task
-	ShardID   int
 	Status    Status
 	Attempts  int
 	NextRunAt time.Time
@@ -112,14 +98,6 @@ type Record struct {
 	UpdatedAt time.Time
 	// CompletedAt 在成功或失败终态时设置，否则为零值。
 	CompletedAt time.Time
-}
-
-// Result 描述一次执行（或登记）后的任务状态。Err 只表示回调或结果落库的错误，
-// 不代表业务事务回滚。
-type Result struct {
-	ID     uuid.UUID
-	Status Status
-	Err    error
 }
 
 // Handler 必须并发安全、幂等，并及时响应 context 取消。
@@ -131,9 +109,8 @@ type Config struct {
 	TableSuffix string
 	// Schema 为空时使用连接的 current_schema()，必须预先存在。
 	Schema string
-	Mode   Mode
 
-	// WorkerCount 是后台补偿 worker 数，默认 8。
+	// WorkerCount 是每个节点同时执行回调的 worker 数，默认 8。
 	WorkerCount int
 	// ScanInterval 是空闲扫描间隔，默认 1 秒；处理满批后会立即再扫。
 	ScanInterval time.Duration
@@ -158,13 +135,10 @@ type Config struct {
 	// FailedRetention 大于 0 时清理失败超过该时长的记录；默认 0 表示保留。
 	FailedRetention time.Duration
 
-	// HeartbeatInterval / NodeTTL 是节点与分片租约的续约间隔和有效期，默认 3 秒 / 15 秒。
-	HeartbeatInterval time.Duration
-	NodeTTL           time.Duration
 	// OperationTimeout 是单次后台数据库操作的超时，默认 5 秒。
 	OperationTimeout time.Duration
 
-	// DisableWorker 为 true 时只登记和首次执行任务，不参与分片和后台补偿。
+	// DisableWorker 为 true 时只登记任务，不执行和清理。
 	DisableWorker bool
 	Logger        *slog.Logger
 	// Metrics 为空时不上报指标。
@@ -187,9 +161,6 @@ func resolveConfig(c Config) (resolvedConfig, error) {
 	}
 	if c.Schema != "" && !identifierPattern.MatchString(c.Schema) {
 		return resolvedConfig{}, fmt.Errorf("%w: unsafe schema name", ErrInvalidConfig)
-	}
-	if c.Mode != ModeInTx && c.Mode != ModeAfterCommit {
-		return resolvedConfig{}, fmt.Errorf("%w: unknown mode %d", ErrInvalidConfig, c.Mode)
 	}
 	if c.WorkerCount < 0 || c.BatchSize < 0 || c.CleanupBatchSize < 0 {
 		return resolvedConfig{}, fmt.Errorf("%w: negative count", ErrInvalidConfig)
@@ -214,8 +185,7 @@ func resolveConfig(c Config) (resolvedConfig, error) {
 		def time.Duration
 	}{
 		{&c.ScanInterval, time.Second}, {&c.RetryBackoffMin, time.Second}, {&c.RetryBackoffMax, 5 * time.Minute},
-		{&c.CleanupAfter, 5 * time.Minute}, {&c.CleanupInterval, 30 * time.Second},
-		{&c.HeartbeatInterval, 3 * time.Second}, {&c.NodeTTL, 15 * time.Second}, {&c.OperationTimeout, 5 * time.Second},
+		{&c.CleanupAfter, 5 * time.Minute}, {&c.CleanupInterval, 30 * time.Second}, {&c.OperationTimeout, 5 * time.Second},
 		{&c.HandlerTimeout, 0}, {&c.LeaseDuration, 0},
 	} {
 		if *d.p == 0 {
@@ -230,9 +200,6 @@ func resolveConfig(c Config) (resolvedConfig, error) {
 	}
 	if c.LeaseDuration <= c.HandlerTimeout {
 		return resolvedConfig{}, fmt.Errorf("%w: lease duration must exceed handler timeout", ErrInvalidConfig)
-	}
-	if c.NodeTTL < 3*c.HeartbeatInterval {
-		return resolvedConfig{}, fmt.Errorf("%w: node TTL must be at least 3 heartbeat intervals", ErrInvalidConfig)
 	}
 	if c.RetryBackoffMax < c.RetryBackoffMin {
 		return resolvedConfig{}, fmt.Errorf("%w: retry backoff max is less than min", ErrInvalidConfig)
