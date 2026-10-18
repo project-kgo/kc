@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -82,12 +83,12 @@ func TestBackoffBounds(t *testing.T) {
 }
 
 func TestInvokeAndOutcome(t *testing.T) {
-	c := &Compensator{config: resolvedConfig{Config: Config{HandlerTimeout: 20 * time.Millisecond, RetryBackoffMin: time.Second, RetryBackoffMax: time.Second}, retries: 2},
-		handlers: map[string]Handler{
-			"panic":  func(context.Context, *Task) error { panic("boom") },
-			"ignore": func(context.Context, *Task) error { time.Sleep(40 * time.Millisecond); return nil },
-			"mutate": func(_ context.Context, task *Task) error { task.Attempt = 99; return nil },
-		}}
+	c := &Compensator{config: resolvedConfig{Config: Config{HandlerTimeout: 20 * time.Millisecond, RetryBackoffMin: time.Second, RetryBackoffMax: time.Second}, retries: 2}}
+	c.handlers.Store(mustRegistry(map[string]Handler{
+		"panic":  func(context.Context, *Task) error { panic("boom") },
+		"ignore": func(context.Context, *Task) error { time.Sleep(40 * time.Millisecond); return nil },
+		"mutate": func(_ context.Context, task *Task) error { task.Attempt = 99; return nil },
+	}))
 	if err := c.invoke(context.Background(), &Task{Type: "panic"}); !errors.Is(err, ErrHandlerPanic) {
 		t.Fatalf("panic: %v", err)
 	}
@@ -149,7 +150,7 @@ func (f *fakeStorage) insert(_ context.Context, _ *sqlx.Tx, tasks []Task) error 
 	return nil
 }
 
-func (f *fakeStorage) claim(ctx context.Context, limit int, token int64) ([]claimed, error) {
+func (f *fakeStorage) claim(ctx context.Context, limit int, token int64, types []string) ([]claimed, error) {
 	if f.beforeClaim != nil {
 		f.beforeClaim(ctx)
 	}
@@ -160,7 +161,7 @@ func (f *fakeStorage) claim(ctx context.Context, limit int, token int64) ([]clai
 		if len(out) == limit {
 			break
 		}
-		if row.status < StatusSucceeded && !row.due.After(time.Now()) {
+		if row.status < StatusSucceeded && !row.due.After(time.Now()) && slices.Contains(types, row.task.Type) {
 			row.status, row.token = StatusRunning, token
 			row.task.Attempt++
 			row.due = time.Now().Add(time.Minute)
@@ -287,7 +288,7 @@ func TestBackgroundRespectsWorkerCount(t *testing.T) {
 	}
 	metrics := &recordingMetrics{}
 	cfg := testConfig(t, Config{WorkerCount: 4, ScanInterval: 10 * time.Millisecond, RetryBackoffMin: time.Millisecond, RetryBackoffMax: 2 * time.Millisecond, Metrics: metrics})
-	c, err := start(context.Background(), nil, store, cfg, map[string]Handler{"t": handler})
+	c, err := start(context.Background(), nil, store, cfg, mustRegistry(map[string]Handler{"t": handler}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +317,7 @@ func TestCloseAbandonsInterruptedTasks(t *testing.T) {
 		return ctx.Err()
 	}
 	cfg := testConfig(t, Config{WorkerCount: 2, ScanInterval: 10 * time.Millisecond})
-	c, err := start(context.Background(), nil, store, cfg, map[string]Handler{"t": handler})
+	c, err := start(context.Background(), nil, store, cfg, mustRegistry(map[string]Handler{"t": handler}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +356,7 @@ func TestCloseDuringClaimReturnsTasks(t *testing.T) {
 	}
 	var calls atomic.Int64
 	cfg := testConfig(t, Config{WorkerCount: 2, ScanInterval: time.Hour})
-	c, err := start(context.Background(), nil, store, cfg, map[string]Handler{"t": func(context.Context, *Task) error { calls.Add(1); return nil }})
+	c, err := start(context.Background(), nil, store, cfg, mustRegistry(map[string]Handler{"t": func(context.Context, *Task) error { calls.Add(1); return nil }}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,17 +382,17 @@ func TestCloseDuringClaimReturnsTasks(t *testing.T) {
 }
 
 func TestCanceledSuccessIsNotFailure(t *testing.T) {
-	c := &Compensator{config: resolvedConfig{Config: Config{HandlerTimeout: time.Second}},
-		handlers: map[string]Handler{"t": func(context.Context, *Task) error { return nil }}}
+	c := &Compensator{config: resolvedConfig{Config: Config{HandlerTimeout: time.Second}}}
 	ctx, cancel := context.WithCancel(context.Background())
-	c.handlers["t"] = func(context.Context, *Task) error { cancel(); return nil }
+	c.handlers.Store(mustRegistry(map[string]Handler{"t": func(context.Context, *Task) error { cancel(); return nil }}))
 	if err := c.invoke(ctx, &Task{Type: "t"}); err != nil {
 		t.Fatalf("handler succeeded before cancellation was observed: %v", err)
 	}
 }
 
 func TestTxAddRejectsDuplicateIDs(t *testing.T) {
-	c := &Compensator{handlers: map[string]Handler{"t": func(context.Context, *Task) error { return nil }}}
+	c := &Compensator{}
+	c.handlers.Store(mustRegistry(map[string]Handler{"t": func(context.Context, *Task) error { return nil }}))
 	tx := &Tx{c: c}
 	id := uuid.Must(uuid.NewV7())
 	if _, err := tx.Add(context.Background(), Task{ID: id, Type: "t"}); err != nil {
@@ -414,5 +415,59 @@ func TestRunnableReportsExhausted(t *testing.T) {
 	}
 	if metrics.count(StatusFailed) != 1 {
 		t.Fatal("exhausted task must be reported")
+	}
+}
+
+func mustRegistry(handlers map[string]Handler) *registry {
+	r, err := (*registry)(nil).with(handlers)
+	if err != nil {
+		panic(err)
+	}
+	return r
+}
+
+// 运行期间注册的类型立即开始被领取；重复、无效注册和关闭后注册都会被拒绝。
+func TestRegisterAfterStart(t *testing.T) {
+	store := newFakeStorage()
+	ids := store.add(3)
+	cfg := testConfig(t, Config{WorkerCount: 2, ScanInterval: time.Hour})
+	c, err := start(context.Background(), nil, store, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = c.prepare(Task{Type: "t"}); !errors.Is(err, ErrNoHandler) {
+		t.Fatalf("unregistered type must be rejected: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if store.count(StatusPending) != 3 {
+		t.Fatal("tasks must not be claimed before their type is registered")
+	}
+	var calls atomic.Int64
+	handler := func(context.Context, *Task) error { calls.Add(1); return nil }
+	if err = c.Register("t", handler); err != nil {
+		t.Fatal(err)
+	}
+	// ScanInterval 为 1 小时，任务能被执行说明 Register 主动唤醒了扫描。
+	waitFor(t, 5*time.Second, func() bool { return store.count(StatusSucceeded) == len(ids) })
+	if _, err = c.prepare(Task{Type: "t"}); err != nil {
+		t.Fatalf("registered type: %v", err)
+	}
+	if err = c.Register("t", handler); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("duplicate register: %v", err)
+	}
+	if err = c.RegisterAll(map[string]Handler{"u": handler, "": handler}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("invalid type: %v", err)
+	}
+	if c.handlers.Load().get("u") != nil {
+		t.Fatal("RegisterAll must be all-or-nothing")
+	}
+	if err = c.Register("v", nil); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("nil handler: %v", err)
+	}
+	if err = c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = c.Register("w", handler); !errors.Is(err, ErrClosed) {
+		t.Fatalf("register after Close: %v", err)
 	}
 }

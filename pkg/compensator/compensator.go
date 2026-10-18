@@ -3,8 +3,10 @@ package compensator
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math"
 	mathrand "math/rand/v2"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,7 +21,7 @@ type Compensator struct {
 	db       *sqlx.DB
 	store    storage
 	config   resolvedConfig
-	handlers map[string]Handler
+	handlers atomic.Pointer[registry] // 写时复制，Register 替换整份快照，读取无锁
 
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -35,8 +37,44 @@ type Compensator struct {
 	backlog atomic.Bool // 上一轮领取满批，worker 空闲时需要立即再扫
 }
 
+// registry 是回调的不可变快照；types 与 handlers 的键一致，供领取语句过滤类型。
+type registry struct {
+	handlers map[string]Handler
+	types    []string
+}
+
+func (r *registry) get(taskType string) Handler {
+	if r == nil {
+		return nil
+	}
+	return r.handlers[taskType]
+}
+
+// with 校验并返回追加了一组回调的新快照，不修改 r。
+func (r *registry) with(handlers map[string]Handler) (*registry, error) {
+	next := &registry{handlers: make(map[string]Handler, len(handlers))}
+	if r != nil {
+		maps.Copy(next.handlers, r.handlers)
+		next.types = slices.Clone(r.types)
+	}
+	for name, handler := range handlers {
+		if err := validateType(name); err != nil {
+			return nil, fmt.Errorf("invalid handler type %q", name)
+		}
+		if handler == nil {
+			return nil, fmt.Errorf("handler %q is nil", name)
+		}
+		if _, dup := next.handlers[name]; dup {
+			return nil, fmt.Errorf("handler %q already registered", name)
+		}
+		next.handlers[name] = handler
+		next.types = append(next.types, name)
+	}
+	return next, nil
+}
+
 // New 自动建表并校验表结构；未关闭后台时启动 worker。
-// ctx 只用于初始化，组件生命周期由 Close 控制。
+// handlers 可为空，之后用 Register 补充；ctx 只用于初始化，组件生命周期由 Close 控制。
 func New(ctx context.Context, db *sqlx.DB, config Config, handlers map[string]Handler) (*Compensator, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("%w: context is nil", ErrInvalidConfig)
@@ -48,37 +86,27 @@ func New(ctx context.Context, db *sqlx.DB, config Config, handlers map[string]Ha
 	if err != nil {
 		return nil, err
 	}
-	if len(handlers) == 0 {
-		return nil, fmt.Errorf("%w: handlers are empty", ErrInvalidConfig)
+	reg, err := (*registry)(nil).with(handlers)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
-	registry := make(map[string]Handler, len(handlers))
-	types := make([]string, 0, len(handlers))
-	for name, handler := range handlers {
-		if err := validateType(name); err != nil {
-			return nil, fmt.Errorf("%w: invalid handler type %q", ErrInvalidConfig, name)
-		}
-		if handler == nil {
-			return nil, fmt.Errorf("%w: handler %q is nil", ErrInvalidConfig, name)
-		}
-		registry[name] = handler
-		types = append(types, name)
-	}
-	store, err := newPGStorage(db, c, types)
+	store, err := newPGStorage(db, c)
 	if err != nil {
 		return nil, err
 	}
 	if err = store.ensureSchema(ctx); err != nil {
 		return nil, fmt.Errorf("compensator: initialize schema: %w", err)
 	}
-	return start(ctx, db, store, c, registry)
+	return start(ctx, db, store, c, reg)
 }
 
-func start(ctx context.Context, db *sqlx.DB, store storage, c resolvedConfig, handlers map[string]Handler) (*Compensator, error) {
+func start(ctx context.Context, db *sqlx.DB, store storage, c resolvedConfig, handlers *registry) (*Compensator, error) {
 	lifecycle, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	comp := &Compensator{
-		db: db, store: store, config: c, handlers: handlers, ctx: lifecycle, cancel: cancel,
+		db: db, store: store, config: c, ctx: lifecycle, cancel: cancel,
 		slots: make(chan struct{}, c.WorkerCount), jobs: make(chan claimed, c.WorkerCount), wake: make(chan struct{}, 1),
 	}
+	comp.handlers.Store(handlers)
 	if c.DisableWorker {
 		return comp, nil
 	}
@@ -101,6 +129,34 @@ func NewFromResource(ctx context.Context, name string, config Config, handlers m
 		return nil, fmt.Errorf("%w: %q", ErrResourceNotFound, name)
 	}
 	return New(ctx, db, config, handlers)
+}
+
+// Register 在组件运行期间注册一个任务类型的回调，注册后本节点立即开始领取该类型的任务，
+// 也可以用它登记该类型的新任务。同一类型只能注册一次，已注册时返回 ErrInvalidArgument。
+func (c *Compensator) Register(taskType string, handler Handler) error {
+	return c.RegisterAll(map[string]Handler{taskType: handler})
+}
+
+// RegisterAll 原子地注册一组回调：任一类型无效或已注册时全部不生效。
+func (c *Compensator) RegisterAll(handlers map[string]Handler) error {
+	if c == nil {
+		return ErrClosed
+	}
+	if len(handlers) == 0 {
+		return fmt.Errorf("%w: handlers are empty", ErrInvalidArgument)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return ErrClosed
+	}
+	next, err := c.handlers.Load().with(handlers)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidArgument, err)
+	}
+	c.handlers.Store(next)
+	c.notify() // 新类型可能已有积压任务，立即扫描一次
+	return nil
 }
 
 // newToken 返回非零随机令牌；0 表示任务未被任何执行者持有。
@@ -131,7 +187,7 @@ func (c *Compensator) prepare(task Task) (Task, error) {
 	if err := validateType(task.Type); err != nil {
 		return Task{}, err
 	}
-	if _, ok := c.handlers[task.Type]; !ok {
+	if c.handlers.Load().get(task.Type) == nil {
 		return Task{}, fmt.Errorf("%w: %q", ErrNoHandler, task.Type)
 	}
 	if task.Attempt != 0 {

@@ -44,6 +44,22 @@ if err != nil {
 
 `Payload` 是 sonic 编码的 JSON 字符串：`NewTask` 用 `sonic.MarshalString` 编码，`Task.Decode` 用 `sonic.UnmarshalString` 解码。已编码的字符串可直接赋值 `Task{Type: "...", Payload: s}`。库中以 `TEXT` 原样保存，不做 JSON 校验或规范化。
 
+### 单独注册回调
+
+`New` 的 `handlers` 可以为空，回调也可以在组件运行期间注册，适合各业务模块各自注册回调的场景：
+
+```go
+comp, err := compensator.New(ctx, db, compensator.Config{TableSuffix: "orders"}, nil)
+// ...
+if err := comp.Register("order.paid", handleOrderPaid); err != nil {
+    return err
+}
+// 或原子地注册一组：任一类型无效或已注册时全部不生效。
+err = comp.RegisterAll(map[string]compensator.Handler{"order.refund": handleRefund})
+```
+
+注册后本节点立即开始领取该类型的任务，也可以登记该类型的新任务；未注册的类型 `Add` / `AddTx` 返回 `ErrNoHandler`。同一类型只能注册一次，重复注册、类型无效或回调为 nil 返回 `ErrInvalidArgument`，关闭后返回 `ErrClosed`。不支持注销。
+
 ## 执行流程
 
 1. **登记**：`Transaction` / `AddTx` 在业务事务内把任务写为 `pending`，随业务一起提交或回滚。回调不会在事务内执行。

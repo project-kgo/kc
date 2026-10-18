@@ -30,6 +30,11 @@ func (c *Compensator) scanLoop() {
 // 领取满批时继续下一批。
 func (c *Compensator) scan() {
 	for c.ctx.Err() == nil {
+		// 每轮读取最新快照，运行期间 Register 的类型在下一轮即被领取。
+		reg := c.handlers.Load()
+		if reg == nil || len(reg.types) == 0 {
+			return
+		}
 		free := c.reserve(c.config.BatchSize)
 		if free == 0 {
 			// 全部 worker 忙碌，由 worker 完成后唤醒。
@@ -39,7 +44,7 @@ func (c *Compensator) scan() {
 		// 领取不随 Close 取消：语句可能已在服务端提交，此时丢弃结果会让任务空等租约到期并白耗
 		// 一次执行次数。关闭期间领到的任务交给 worker，由它归还且不消耗次数。
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.ctx), c.config.OperationTimeout)
-		tasks, err := c.store.claim(ctx, free, newToken())
+		tasks, err := c.store.claim(ctx, free, newToken(), reg.types)
 		cancel()
 		if err != nil {
 			c.unreserve(free)
@@ -146,7 +151,7 @@ func (c *Compensator) outcome(attempt int, err error) (Status, string, time.Dura
 
 // invoke 以 HandlerTimeout 调用回调，panic 转为错误，并传递任务副本。
 func (c *Compensator) invoke(ctx context.Context, task *Task) (err error) {
-	handler := c.handlers[task.Type]
+	handler := c.handlers.Load().get(task.Type)
 	if handler == nil {
 		return fmt.Errorf("%w: %q", ErrNoHandler, task.Type)
 	}

@@ -24,7 +24,8 @@ type claimed struct {
 // 调度逻辑通过该接口访问数据库，便于在单元测试中替换。
 type storage interface {
 	insert(ctx context.Context, tx *sqlx.Tx, tasks []Task) error
-	claim(ctx context.Context, limit int, token int64) ([]claimed, error)
+	// claim 只领取 types 中的任务类型。
+	claim(ctx context.Context, limit int, token int64, types []string) ([]claimed, error)
 	finish(ctx context.Context, c claimed, status Status, lastError string, delay time.Duration) error
 	abandon(ctx context.Context, c claimed) error
 	get(ctx context.Context, id uuid.UUID) (Record, error)
@@ -37,20 +38,19 @@ type pgStorage struct {
 	db       *sqlx.DB
 	config   resolvedConfig
 	taskName string
-	tasks    string   // 已带 schema 并加引号的完整表名
-	types    []string // 本节点注册了回调的任务类型，只领取这些类型
+	tasks    string // 已带 schema 并加引号的完整表名
 
 	insertSQL, claimSQL, finishSQL string
 }
 
-func newPGStorage(db *sqlx.DB, c resolvedConfig, types []string) (*pgStorage, error) {
+func newPGStorage(db *sqlx.DB, c resolvedConfig) (*pgStorage, error) {
 	if db == nil {
 		return nil, fmt.Errorf("%w: database is nil", ErrInvalidConfig)
 	}
 	if name := db.DriverName(); name != "pgx" && name != "pgx/v5" {
 		return nil, fmt.Errorf("%w: unsupported driver %q, only pgx is supported", ErrInvalidConfig, name)
 	}
-	return &pgStorage{db: db, config: c, taskName: "compensator_" + c.TableSuffix, types: types}, nil
+	return &pgStorage{db: db, config: c, taskName: "compensator_" + c.TableSuffix}, nil
 }
 
 // setNames 在确定 schema 后预先拼好热路径 SQL，避免每次调用重复格式化。
@@ -96,8 +96,8 @@ func (s *pgStorage) insert(ctx context.Context, tx *sqlx.Tx, tasks []Task) error
 	return err
 }
 
-func (s *pgStorage) claim(ctx context.Context, limit int, token int64) ([]claimed, error) {
-	rows, err := s.db.QueryContext(ctx, s.claimSQL, limit, token, s.config.retries+1, s.config.LeaseDuration.Milliseconds(), s.types)
+func (s *pgStorage) claim(ctx context.Context, limit int, token int64, types []string) ([]claimed, error) {
+	rows, err := s.db.QueryContext(ctx, s.claimSQL, limit, token, s.config.retries+1, s.config.LeaseDuration.Milliseconds(), types)
 	if err != nil {
 		return nil, err
 	}
