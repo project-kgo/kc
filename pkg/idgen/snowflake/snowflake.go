@@ -48,16 +48,23 @@ const (
 	stateLeaseLost
 )
 
-// Snowflake 是一个由数据库租约保护的并发安全 ID 生成器。
-type Snowflake struct {
-	node       *node
-	storage    *storage
-	workerID   int64
-	leaseToken string
+// lease 是当前持有的 worker 租约，丢失后整体替换。
+type lease struct {
+	node     *node
+	workerID int64
+	token    string
+}
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	done   chan struct{}
+// Snowflake 是一个由数据库租约保护的并发安全 ID 生成器。
+// 租约丢失后会在后台自动申请新的 worker，期间 Generate 返回 ErrLeaseLost。
+type Snowflake struct {
+	storage *storage
+	lease   atomic.Pointer[lease]
+
+	ctx     context.Context
+	cancel  context.CancelFunc
+	done    chan struct{}
+	recover chan struct{}
 
 	lastHeartbeat atomic.Pointer[time.Time]
 	state         atomic.Uint32
@@ -103,14 +110,13 @@ func New(ctx context.Context, db *sqlx.DB, config Config) (*Snowflake, error) {
 
 	workerCtx, cancel := context.WithCancel(ctx)
 	generator := &Snowflake{
-		node:       node,
-		storage:    store,
-		workerID:   allocated.workerID,
-		leaseToken: allocated.leaseToken,
-		ctx:        workerCtx,
-		cancel:     cancel,
-		done:       make(chan struct{}),
+		storage: store,
+		ctx:     workerCtx,
+		cancel:  cancel,
+		done:    make(chan struct{}),
+		recover: make(chan struct{}, 1),
 	}
+	generator.lease.Store(&lease{node: node, workerID: allocated.workerID, token: allocated.leaseToken})
 	generator.recordHeartbeat(time.Now())
 	generator.state.Store(stateActive)
 	go generator.heartbeatLoop()
@@ -144,10 +150,16 @@ func (s *Snowflake) Generate() (int64, error) {
 		return 0, ErrClosed
 	}
 	if s.heartbeatExpired(time.Now()) {
-		s.state.CompareAndSwap(stateActive, stateLeaseLost)
+		if s.markLeaseLost("heartbeat expired") {
+			// 进程挂起（休眠、断点）恢复后立即重新申请，不必等下一次心跳。
+			select {
+			case s.recover <- struct{}{}:
+			default:
+			}
+		}
 		return 0, ErrLeaseLost
 	}
-	return s.node.generate()
+	return s.lease.Load().node.generate()
 }
 
 // GetWorkerID 返回当前实例持有的 worker ID。
@@ -155,15 +167,15 @@ func (s *Snowflake) GetWorkerID() int64 {
 	if s == nil {
 		return 0
 	}
-	return s.workerID
+	return s.lease.Load().workerID
 }
 
 // GetTimeFromID 从 ID 中解析 Unix 毫秒时间戳。
 func (s *Snowflake) GetTimeFromID(id int64) int64 {
-	if s == nil || s.node == nil {
+	if s == nil || s.lease.Load() == nil {
 		return 0
 	}
-	return s.node.getTimeFromID(id)
+	return s.lease.Load().node.getTimeFromID(id)
 }
 
 // GetTime 从 ID 中解析生成时间。
@@ -184,7 +196,8 @@ func (s *Snowflake) Close() error {
 
 		ctx, cancel := context.WithTimeout(context.Background(), defaultCloseTimeout)
 		defer cancel()
-		s.closeErr = s.storage.release(ctx, s.workerID, s.leaseToken, s.node.latestTimestamp())
+		current := s.lease.Load()
+		s.closeErr = s.storage.release(ctx, current.workerID, current.token, current.node.retire())
 	})
 	return s.closeErr
 }
@@ -198,27 +211,75 @@ func (s *Snowflake) heartbeatLoop() {
 		select {
 		case <-s.ctx.Done():
 			return
+		case <-s.recover:
 		case <-ticker.C:
+		}
+		if s.state.Load() == stateActive {
 			if err := s.updateHeartbeat(); err != nil {
 				if s.ctx.Err() != nil {
 					return
 				}
 				if errors.Is(err, ErrLeaseLost) {
-					s.state.CompareAndSwap(stateActive, stateLeaseLost)
-					return
-				}
-				slog.Error("snowflake heartbeat failed", "worker_id", s.workerID, "error", err)
-				if s.heartbeatExpired(time.Now()) {
-					s.state.CompareAndSwap(stateActive, stateLeaseLost)
-					return
+					s.markLeaseLost("lease token replaced")
+				} else {
+					slog.Error("snowflake heartbeat failed", "worker_id", s.GetWorkerID(), "error", err)
+					if s.heartbeatExpired(time.Now()) {
+						s.markLeaseLost("heartbeat expired")
+					}
 				}
 			}
+		}
+		if s.state.Load() == stateLeaseLost {
+			s.recoverLease()
 		}
 	}
 }
 
+func (s *Snowflake) markLeaseLost(reason string) bool {
+	if !s.state.CompareAndSwap(stateActive, stateLeaseLost) {
+		return false
+	}
+	slog.Warn("snowflake worker lease lost", "worker_id", s.GetWorkerID(), "reason", reason)
+	return true
+}
+
+// recoverLease 停用旧节点、释放旧租约并申请新 worker；失败时等下一次心跳重试。
+func (s *Snowflake) recoverLease() {
+	old := s.lease.Load()
+	// 先停用旧节点再释放，保证旧 ID 的时间戳都写入了时间屏障；token 不匹配时释放是空操作。
+	if err := releaseAllocation(s.storage, allocation{workerID: old.workerID, leaseToken: old.token, lastTimestamp: old.node.retire()}); err != nil {
+		slog.Warn("snowflake release lost lease failed", "worker_id", old.workerID, "error", err)
+	}
+	allocated, err := s.storage.allocateWorker(s.ctx, old.node.epoch)
+	if err != nil {
+		if s.ctx.Err() == nil {
+			slog.Error("snowflake reallocate worker failed", "error", err)
+		}
+		return
+	}
+	node, err := newNode(allocated.workerID, old.node.epoch)
+	if err == nil {
+		err = waitForClock(s.ctx, allocated.lastTimestamp)
+	}
+	if err != nil {
+		if releaseErr := releaseAllocation(s.storage, allocated); releaseErr != nil {
+			err = errors.Join(err, releaseErr)
+		}
+		if s.ctx.Err() == nil {
+			slog.Error("snowflake reallocate worker failed", "worker_id", allocated.workerID, "error", err)
+		}
+		return
+	}
+	s.lease.Store(&lease{node: node, workerID: allocated.workerID, token: allocated.leaseToken})
+	s.recordHeartbeat(time.Now())
+	if s.state.CompareAndSwap(stateLeaseLost, stateActive) {
+		slog.Info("snowflake worker lease recovered", "old_worker_id", old.workerID, "worker_id", allocated.workerID)
+	}
+}
+
 func (s *Snowflake) updateHeartbeat() error {
-	if err := s.storage.heartbeat(s.ctx, s.workerID, s.leaseToken, s.node.latestTimestamp()); err != nil {
+	current := s.lease.Load()
+	if err := s.storage.heartbeat(s.ctx, current.workerID, current.token, current.node.latestTimestamp()); err != nil {
 		return err
 	}
 	s.recordHeartbeat(time.Now())

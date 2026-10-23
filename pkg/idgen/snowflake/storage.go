@@ -18,10 +18,11 @@ import (
 )
 
 const (
-	defaultTableName        = "snowflake_workers"
-	defaultHeartbeat        = 3 * time.Second
-	defaultWorkerTimeout    = 15 * time.Second
-	defaultSafetyThreshold  = 10 * time.Second
+	defaultTableName     = "snowflake_workers"
+	defaultHeartbeat     = 10 * time.Second
+	defaultWorkerTimeout = 30 * time.Second
+	// 必须小于 defaultWorkerTimeout，留出余量吸收本机与数据库的时钟偏差。
+	defaultSafetyThreshold  = 20 * time.Second
 	defaultCloseTimeout     = 5 * time.Second
 	maxStartupClockRollback = 5 * time.Second
 	workerAllocationRetries = 8

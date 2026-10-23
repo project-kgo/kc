@@ -194,9 +194,31 @@ func runSQLIntegration(t *testing.T, driver, environment string) {
 	if err := replacement.updateHeartbeat(); !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("stale lease heartbeat error = %v, want ErrLeaseLost", err)
 	}
-	replacement.state.CompareAndSwap(stateActive, stateLeaseLost)
+	lostWorkerID := replacement.GetWorkerID()
+	lostLastID := replacementFirstID
+	replacement.markLeaseLost("test")
 	if _, err := replacement.Generate(); !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("stale generator error = %v, want ErrLeaseLost", err)
+	}
+
+	// 租约丢失后后台应申请新 worker 并恢复生成。
+	replacement.recover <- struct{}{}
+	var recoveredID int64
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		recoveredID, err = replacement.Generate()
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, ErrLeaseLost) || time.Now().After(deadline) {
+			t.Fatalf("generator did not recover: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if replacement.GetWorkerID() == lostWorkerID {
+		t.Fatalf("recovered worker ID = %d, must differ from stolen worker %d", lostWorkerID, lostWorkerID)
+	}
+	if recoveredID <= lostLastID {
+		t.Fatalf("recovered ID = %d, must be greater than %d", recoveredID, lostLastID)
 	}
 
 	// Snowflake.Close 不能关闭借用的共享数据库连接。

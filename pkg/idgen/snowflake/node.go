@@ -31,6 +31,7 @@ type node struct {
 	workerID  int64
 	sequence  int64
 	epoch     int64
+	retired   bool
 	now       func() time.Time
 	sleep     func(time.Duration)
 }
@@ -54,6 +55,9 @@ func (n *node) generate() (int64, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	if n.retired {
+		return 0, ErrLeaseLost
+	}
 	current := n.now().UnixMilli()
 	if current < n.timestamp {
 		return 0, fmt.Errorf("%w: current timestamp %d is behind %d", ErrClockBackwards, current, n.timestamp)
@@ -92,6 +96,14 @@ func (n *node) generate() (int64, error) {
 func (n *node) latestTimestamp() int64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	return n.timestamp
+}
+
+// retire 让节点停止生成并返回最后使用的时间戳，之后释放租约不会再有新 ID 越过该时间戳。
+func (n *node) retire() int64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.retired = true
 	return n.timestamp
 }
 

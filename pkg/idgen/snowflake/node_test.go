@@ -192,7 +192,8 @@ func TestGenerateRejectsClosedAndExpiredLease(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	generator := &Snowflake{node: node, ctx: ctx}
+	generator := &Snowflake{ctx: ctx}
+	generator.lease.Store(&lease{node: node, workerID: 1})
 	generator.state.Store(stateClosed)
 	if _, err := generator.Generate(); !errors.Is(err, ErrClosed) {
 		t.Fatalf("closed Generate error = %v, want ErrClosed", err)
@@ -205,6 +206,23 @@ func TestGenerateRejectsClosedAndExpiredLease(t *testing.T) {
 	}
 	if generator.state.Load() != stateLeaseLost {
 		t.Fatal("expired lease must transition to stateLeaseLost")
+	}
+}
+
+func TestRetiredNodeStopsGenerating(t *testing.T) {
+	node, err := newNode(1, DefaultEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := node.generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last := node.retire(); last != node.getTimeFromID(id) {
+		t.Fatalf("retire returned %d, want %d", last, node.getTimeFromID(id))
+	}
+	if _, err := node.generate(); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("retired generate error = %v, want ErrLeaseLost", err)
 	}
 }
 
