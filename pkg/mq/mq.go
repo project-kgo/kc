@@ -36,10 +36,24 @@ type Publisher interface {
 }
 
 // Subscriber 提供按主题和消费组异步订阅消息的能力。
-// Subscribe 在订阅后台任务启动后返回，后台消费会一直持续到 ctx 取消或 MQ 关闭。
 // options 仅影响本次订阅；同一客户端上的不同订阅可以使用不同参数。
 type Subscriber interface {
+	// Subscribe 在订阅后台任务启动后返回，后台消费会一直持续到 ctx 取消或 MQ 关闭。
+	// 取消 ctx 会同时取消正在执行的 Handler，需要优雅停止时使用 Consume。
 	Subscribe(ctx context.Context, topic, group string, handler Handler, options ...SubscribeOption) error
+	// Consume 与 Subscribe 一样启动后台消费，但订阅只能通过返回的 Subscription 或 MQ 关闭来停止：
+	// ctx 只约束本次调用（参数校验、建组等），并把其中的值传给 Handler，之后取消 ctx 不影响订阅。
+	Consume(ctx context.Context, topic, group string, handler Handler, options ...SubscribeOption) (Subscription, error)
+}
+
+// Subscription 是 Consume 返回的订阅句柄，可并发、重复调用。
+type Subscription interface {
+	// Stop 停止拉取新消息，不再启动新的 Handler（已拉取但未开始的消息不确认，之后重新投递），
+	// 等待已经开始的 Handler 及其确认完成后返回 nil。
+	// ctx 先结束时以 ErrClosed 取消仍在执行的 Handler，等它们返回后再返回 ctx.Err()。
+	Stop(ctx context.Context) error
+	// Done 在订阅的全部后台任务退出后关闭，包括被 MQ 关闭的情况。
+	Done() <-chan struct{}
 }
 
 // MQ 组合消息发布、订阅和资源释放能力。

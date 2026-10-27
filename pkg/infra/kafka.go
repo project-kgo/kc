@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/project-kgo/kc/internal/mqruntime"
 	coremq "github.com/project-kgo/kc/pkg/mq"
 	"github.com/project-kgo/kc/pkg/resource"
 	"github.com/twmb/franz-go/pkg/kerr"
@@ -117,21 +118,6 @@ type kafkaSubscriptionConfig struct {
 	startOffset *coremq.KafkaStartOffset
 }
 
-type kafkaMQState uint8
-
-const (
-	kafkaMQOpen kafkaMQState = iota
-	kafkaMQClosing
-	kafkaMQClosed
-)
-
-type kafkaSubscription struct {
-	// stop 停止拉取新消息；abort 取消仍在执行的 Handler，只在关闭超时时使用。
-	stop  context.CancelFunc
-	abort context.CancelCauseFunc
-	done  chan struct{}
-}
-
 type kafkaMQ struct {
 	producer    kafkaProducer
 	newConsumer kafkaConsumerFactory
@@ -142,11 +128,7 @@ type kafkaMQ struct {
 	// shareDeliveryLimit 是 broker 的 group.share.delivery.count.limit，0 表示未知。
 	shareDeliveryLimit int
 
-	mu            sync.Mutex
-	state         kafkaMQState
-	subscriptions map[*kafkaSubscription]struct{}
-	operations    sync.WaitGroup
-	closeDone     chan struct{}
+	lifecycle *mqruntime.Lifecycle
 }
 
 type kafkaPartitionKey struct {
@@ -176,13 +158,11 @@ func newKafkaMQ(
 	config kafkaRuntimeConfig,
 ) *kafkaMQ {
 	return &kafkaMQ{
-		producer:      producer,
-		newConsumer:   newConsumer,
-		config:        config,
-		mode:          mode,
-		state:         kafkaMQOpen,
-		subscriptions: make(map[*kafkaSubscription]struct{}),
-		closeDone:     make(chan struct{}),
+		producer:    producer,
+		newConsumer: newConsumer,
+		config:      config,
+		mode:        mode,
+		lifecycle:   mqruntime.NewLifecycle(),
 	}
 }
 
@@ -196,10 +176,10 @@ func (m *kafkaMQ) Publish(ctx context.Context, topic string, message *coremq.Mes
 	if message == nil {
 		return fmt.Errorf("%w: message is nil", coremq.ErrInvalidArgument)
 	}
-	if !m.beginOperation() {
+	if !m.lifecycle.Begin() {
 		return coremq.ErrClosed
 	}
-	defer m.endOperation()
+	defer m.lifecycle.End()
 
 	record := kafkaRecordFromMessage(topic, message)
 	if err := m.producer.ProduceSync(ctx, record).FirstErr(); err != nil {
@@ -215,43 +195,54 @@ func (m *kafkaMQ) Subscribe(
 	handler coremq.Handler,
 	options ...coremq.SubscribeOption,
 ) error {
-	if ctx == nil {
-		return fmt.Errorf("%w: context is nil", coremq.ErrInvalidArgument)
-	}
-	if strings.TrimSpace(topic) == "" {
-		return fmt.Errorf("%w: topic is empty", coremq.ErrInvalidArgument)
-	}
-	if strings.TrimSpace(group) == "" {
-		return fmt.Errorf("%w: consumer group is empty", coremq.ErrInvalidArgument)
-	}
-	if handler == nil {
-		return fmt.Errorf("%w: handler is nil", coremq.ErrInvalidArgument)
-	}
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("subscribe kafka: %w", err)
-	}
+	_, err := m.subscribe(ctx, ctx, topic, group, handler, options...)
+	return err
+}
 
+func (m *kafkaMQ) Consume(
+	ctx context.Context,
+	topic string,
+	group string,
+	handler coremq.Handler,
+	options ...coremq.SubscribeOption,
+) (coremq.Subscription, error) {
+	subscription, err := m.subscribe(ctx, context.WithoutCancel(ctx), topic, group, handler, options...)
+	if err != nil {
+		return nil, err
+	}
+	return subscription, nil
+}
+
+// subscribe 建立订阅；lifetime 结束时立即停止拉取并取消 Handler。
+func (m *kafkaMQ) subscribe(
+	ctx context.Context,
+	lifetime context.Context,
+	topic string,
+	group string,
+	handler coremq.Handler,
+	options ...coremq.SubscribeOption,
+) (*mqruntime.Subscription, error) {
+	if err := mqruntime.ValidateSubscribe(ctx, topic, group, handler); err != nil {
+		return nil, fmt.Errorf("subscribe kafka: %w", err)
+	}
 	config, err := m.subscriptionConfig(options...)
 	if err != nil {
-		return fmt.Errorf("subscribe kafka: %w", err)
+		return nil, fmt.Errorf("subscribe kafka: %w", err)
 	}
-	if !m.beginOperation() {
-		return coremq.ErrClosed
+	if !m.lifecycle.Begin() {
+		return nil, coremq.ErrClosed
 	}
-	defer m.endOperation()
+	defer m.lifecycle.End()
 
 	if err := m.checkDeadLetterTopic(ctx, topic, config); err != nil {
-		return fmt.Errorf("subscribe kafka: %w", err)
+		return nil, fmt.Errorf("subscribe kafka: %w", err)
 	}
 
-	pollCtx, stop := context.WithCancel(ctx)
-	workCtx, abort := context.WithCancelCause(ctx)
-	subscription := &kafkaSubscription{stop: stop, abort: abort, done: make(chan struct{})}
-	factories := m.sessionFactories(workCtx, topic, group, handler, config)
+	subscription := m.lifecycle.NewSubscription(lifetime)
+	factories := m.sessionFactories(subscription.WorkContext(), topic, group, handler, config)
 	sessions := make([]kafkaSession, 0, len(factories))
 	closeSessions := func(cause error) {
-		stop()
-		abort(cause)
+		subscription.Abort(cause)
 		for _, session := range sessions {
 			_ = closeKafkaConsumer(session.consumer, config.mode)
 		}
@@ -260,17 +251,17 @@ func (m *kafkaMQ) Subscribe(
 		session, err := factory()
 		if err != nil {
 			closeSessions(err)
-			return fmt.Errorf("create kafka consumer: %w", err)
+			return nil, fmt.Errorf("create kafka consumer: %w", err)
 		}
 		sessions = append(sessions, session)
 	}
-	if !m.trackSubscription(subscription) {
+	if !m.lifecycle.Track(subscription) {
 		closeSessions(coremq.ErrClosed)
-		return coremq.ErrClosed
+		return nil, coremq.ErrClosed
 	}
 
-	go m.runSubscription(pollCtx, topic, group, config, subscription, factories, sessions)
-	return nil
+	go m.runSubscription(topic, group, config, subscription, factories, sessions)
+	return subscription, nil
 }
 
 func (m *kafkaMQ) Close() error {
@@ -279,78 +270,10 @@ func (m *kafkaMQ) Close() error {
 
 // closeContext 停止拉取并等待已经开始的 Handler 和确认完成；ctx 结束后取消仍在执行的 Handler 再继续等待。
 func (m *kafkaMQ) closeContext(ctx context.Context) error {
-	m.mu.Lock()
-	if m.state != kafkaMQOpen {
-		done := m.closeDone
-		m.mu.Unlock()
-		select {
-		case <-done:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	m.state = kafkaMQClosing
-	subscriptions := make([]*kafkaSubscription, 0, len(m.subscriptions))
-	for subscription := range m.subscriptions {
-		subscription.stop()
-		subscriptions = append(subscriptions, subscription)
-	}
-	m.mu.Unlock()
-
-	stopped := make(chan struct{})
-	go func() {
-		m.operations.Wait()
-		for _, subscription := range subscriptions {
-			<-subscription.done
-		}
-		close(stopped)
-	}()
-	select {
-	case <-stopped:
-	case <-ctx.Done():
-		for _, subscription := range subscriptions {
-			subscription.abort(coremq.ErrClosed)
-		}
-		<-stopped
-	}
-	m.producer.Close()
-
-	m.mu.Lock()
-	m.state = kafkaMQClosed
-	close(m.closeDone)
-	m.mu.Unlock()
-	return nil
-}
-
-func (m *kafkaMQ) beginOperation() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.state != kafkaMQOpen {
-		return false
-	}
-	m.operations.Add(1)
-	return true
-}
-
-func (m *kafkaMQ) endOperation() {
-	m.operations.Done()
-}
-
-func (m *kafkaMQ) trackSubscription(subscription *kafkaSubscription) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.state != kafkaMQOpen {
-		return false
-	}
-	m.subscriptions[subscription] = struct{}{}
-	return true
-}
-
-func (m *kafkaMQ) untrackSubscription(subscription *kafkaSubscription) {
-	m.mu.Lock()
-	delete(m.subscriptions, subscription)
-	m.mu.Unlock()
+	return m.lifecycle.Close(ctx, func() error {
+		m.producer.Close()
+		return nil
+	})
 }
 
 // checkDeadLetterTopic 在订阅前确认 DLQ topic 存在。producer 不自动建 topic，
@@ -417,14 +340,15 @@ func (m *kafkaMQ) sessionFactories(
 }
 
 func (m *kafkaMQ) runSubscription(
-	pollCtx context.Context,
 	topic string,
 	group string,
 	config kafkaSubscriptionConfig,
-	subscription *kafkaSubscription,
+	subscription *mqruntime.Subscription,
 	factories []kafkaSessionFactory,
 	sessions []kafkaSession,
 ) {
+	defer subscription.Finish()
+	pollCtx := subscription.PollContext()
 	var instances sync.WaitGroup
 	for index, session := range sessions {
 		instances.Add(1)
@@ -434,11 +358,6 @@ func (m *kafkaMQ) runSubscription(
 		}()
 	}
 	instances.Wait()
-
-	subscription.stop()
-	subscription.abort(context.Canceled)
-	m.untrackSubscription(subscription)
-	close(subscription.done)
 }
 
 // runSession 只在 client 不可用时重建；单条消息失败、DLQ 失败或重平衡都在 client 内部处理，不会退出消费组。

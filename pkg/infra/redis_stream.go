@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/project-kgo/kc/internal/mqruntime"
 	coremq "github.com/project-kgo/kc/pkg/mq"
 	"github.com/project-kgo/kc/pkg/resource"
 	"github.com/redis/go-redis/v9"
@@ -84,18 +85,7 @@ type redisStreamRuntimeConfig struct {
 	logger                     *slog.Logger
 }
 
-type redisStreamMQState uint8
-
-const (
-	redisStreamMQOpen redisStreamMQState = iota
-	redisStreamMQClosing
-	redisStreamMQClosed
-)
-
 type redisStreamSubscription struct {
-	stop context.CancelFunc
-	done chan struct{}
-
 	queue    chan redis.XMessage
 	ackQueue chan string
 	mu       sync.Mutex
@@ -150,15 +140,9 @@ func (s *redisStreamSubscription) setReclaimCursor(cursor string) {
 }
 
 type redisStreamMQ struct {
-	store  redisStreamStore
-	config redisStreamRuntimeConfig
-
-	mu            sync.Mutex
-	state         redisStreamMQState
-	subscriptions map[*redisStreamSubscription]struct{}
-	operations    sync.WaitGroup
-	closeDone     chan struct{}
-	closeErr      error
+	store     redisStreamStore
+	config    redisStreamRuntimeConfig
+	lifecycle *mqruntime.Lifecycle
 }
 
 type redisStreamStore interface {
@@ -209,13 +193,7 @@ return deleted
 `
 
 func newRedisStreamMQ(store redisStreamStore, config redisStreamRuntimeConfig) *redisStreamMQ {
-	return &redisStreamMQ{
-		store:         store,
-		config:        config,
-		state:         redisStreamMQOpen,
-		subscriptions: make(map[*redisStreamSubscription]struct{}),
-		closeDone:     make(chan struct{}),
-	}
+	return &redisStreamMQ{store: store, config: config, lifecycle: mqruntime.NewLifecycle()}
 }
 
 func (m *redisStreamMQ) Publish(ctx context.Context, topic string, message *coremq.Message) error {
@@ -228,10 +206,10 @@ func (m *redisStreamMQ) Publish(ctx context.Context, topic string, message *core
 	if message == nil {
 		return fmt.Errorf("%w: message is nil", coremq.ErrInvalidArgument)
 	}
-	if !m.beginOperation() {
+	if !m.lifecycle.Begin() {
 		return coremq.ErrClosed
 	}
-	defer m.endOperation()
+	defer m.lifecycle.End()
 
 	values, err := marshalRedisStreamMessage(message)
 	if err != nil {
@@ -250,130 +228,85 @@ func (m *redisStreamMQ) Subscribe(
 	handler coremq.Handler,
 	options ...coremq.SubscribeOption,
 ) error {
-	if ctx == nil {
-		return fmt.Errorf("%w: context is nil", coremq.ErrInvalidArgument)
+	_, err := m.subscribe(ctx, ctx, topic, group, handler, options...)
+	return err
+}
+
+func (m *redisStreamMQ) Consume(
+	ctx context.Context,
+	topic string,
+	group string,
+	handler coremq.Handler,
+	options ...coremq.SubscribeOption,
+) (coremq.Subscription, error) {
+	handle, err := m.subscribe(ctx, context.WithoutCancel(ctx), topic, group, handler, options...)
+	if err != nil {
+		return nil, err
 	}
-	if strings.TrimSpace(topic) == "" {
-		return fmt.Errorf("%w: topic is empty", coremq.ErrInvalidArgument)
-	}
-	if strings.TrimSpace(group) == "" {
-		return fmt.Errorf("%w: consumer group is empty", coremq.ErrInvalidArgument)
-	}
-	if handler == nil {
-		return fmt.Errorf("%w: handler is nil", coremq.ErrInvalidArgument)
-	}
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("subscribe redis stream: %w", err)
+	return handle, nil
+}
+
+// subscribe 建立订阅；lifetime 结束时立即停止拉取并取消 Handler。
+func (m *redisStreamMQ) subscribe(
+	ctx context.Context,
+	lifetime context.Context,
+	topic string,
+	group string,
+	handler coremq.Handler,
+	options ...coremq.SubscribeOption,
+) (*mqruntime.Subscription, error) {
+	if err := mqruntime.ValidateSubscribe(ctx, topic, group, handler); err != nil {
+		return nil, fmt.Errorf("subscribe redis stream: %w", err)
 	}
 	subscriptionConfig, err := m.subscriptionConfig(options...)
 	if err != nil {
-		return fmt.Errorf("subscribe redis stream: %w", err)
+		return nil, fmt.Errorf("subscribe redis stream: %w", err)
 	}
-	if !m.beginOperation() {
-		return coremq.ErrClosed
+	if !m.lifecycle.Begin() {
+		return nil, coremq.ErrClosed
 	}
-	defer m.endOperation()
+	defer m.lifecycle.End()
 
 	stream := m.streamKey(topic)
 	if err := m.store.EnsureGroup(ctx, stream, group, m.config.groupStartID); err != nil {
-		return fmt.Errorf("create redis stream group: %w", err)
+		return nil, fmt.Errorf("create redis stream group: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("subscribe redis stream: %w", err)
+		return nil, fmt.Errorf("subscribe redis stream: %w", err)
 	}
 
-	pollCtx, stop := context.WithCancel(ctx)
+	handle := m.lifecycle.NewSubscription(lifetime)
 	subscription := &redisStreamSubscription{
-		stop:          stop,
-		done:          make(chan struct{}),
 		queue:         make(chan redis.XMessage, subscriptionConfig.queueDepth),
 		ackQueue:      make(chan string, subscriptionConfig.queueDepth),
 		inFlight:      make(map[string]struct{}),
 		reclaimCursor: "0-0",
 	}
-	if !m.trackSubscription(subscription) {
-		stop()
-		return coremq.ErrClosed
+	if !m.lifecycle.Track(handle) {
+		handle.Abort(coremq.ErrClosed)
+		return nil, coremq.ErrClosed
 	}
 
 	consumer := m.subscriptionConsumerID()
-	go m.runSubscription(pollCtx, ctx, topic, stream, group, consumer, handler, subscriptionConfig, subscription)
-	return nil
+	go m.runSubscription(handle, topic, stream, group, consumer, handler, subscriptionConfig, subscription)
+	return handle, nil
 }
 
 func (m *redisStreamMQ) Close() error {
-	m.mu.Lock()
-	if m.state != redisStreamMQOpen {
-		done := m.closeDone
-		m.mu.Unlock()
-		<-done
-		m.mu.Lock()
-		err := m.closeErr
-		m.mu.Unlock()
-		return err
-	}
-	m.state = redisStreamMQClosing
-	subscriptions := make([]*redisStreamSubscription, 0, len(m.subscriptions))
-	for subscription := range m.subscriptions {
-		subscription.stop()
-		subscriptions = append(subscriptions, subscription)
-	}
-	m.mu.Unlock()
-
-	// state 已经变为 closing，不会再有新的 operations.Add 与 Wait 并发发生。
-	m.operations.Wait()
-	for _, subscription := range subscriptions {
-		<-subscription.done
-	}
-	closeErr := m.store.Close()
-
-	m.mu.Lock()
-	m.closeErr = closeErr
-	m.state = redisStreamMQClosed
-	close(m.closeDone)
-	m.mu.Unlock()
-	return closeErr
+	return m.closeContext(context.Background())
 }
 
-func (m *redisStreamMQ) beginOperation() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.state != redisStreamMQOpen {
-		return false
-	}
-	m.operations.Add(1)
-	return true
-}
-
-func (m *redisStreamMQ) endOperation() {
-	m.operations.Done()
+// closeContext 停止拉取并等待已经开始的 Handler 和确认完成；ctx 结束后取消仍在执行的 Handler 再继续等待。
+func (m *redisStreamMQ) closeContext(ctx context.Context) error {
+	return m.lifecycle.Close(ctx, m.store.Close)
 }
 
 func (m *redisStreamMQ) isClosed() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.state != redisStreamMQOpen
-}
-
-func (m *redisStreamMQ) trackSubscription(subscription *redisStreamSubscription) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.state != redisStreamMQOpen {
-		return false
-	}
-	m.subscriptions[subscription] = struct{}{}
-	return true
-}
-
-func (m *redisStreamMQ) untrackSubscription(subscription *redisStreamSubscription) {
-	m.mu.Lock()
-	delete(m.subscriptions, subscription)
-	m.mu.Unlock()
+	return m.lifecycle.Closed()
 }
 
 func (m *redisStreamMQ) runSubscription(
-	pollCtx context.Context,
-	subscriptionCtx context.Context,
+	handle *mqruntime.Subscription,
 	topic string,
 	stream string,
 	group string,
@@ -382,10 +315,9 @@ func (m *redisStreamMQ) runSubscription(
 	config redisStreamRuntimeConfig,
 	subscription *redisStreamSubscription,
 ) {
-	defer func() {
-		m.untrackSubscription(subscription)
-		close(subscription.done)
-	}()
+	defer handle.Finish()
+	// pollCtx 结束后不再拉取和启动新的 Handler；subscriptionCtx 只在强制停止时取消，已成功的 Handler 仍可提交 ACK。
+	pollCtx, subscriptionCtx := handle.PollContext(), handle.WorkContext()
 
 	var producers sync.WaitGroup
 	producers.Add(2)
@@ -581,7 +513,7 @@ func (m *redisStreamMQ) runRedisStreamWorker(
 				subscription.release(record.ID)
 				continue
 			}
-			// Close 只取消 pollCtx，仍允许已成功的 Handler 提交 ACK；订阅取消则不确认失效结果。
+			// 停止订阅只取消 pollCtx，仍允许已成功的 Handler 提交 ACK；强制取消则不确认失效结果。
 			select {
 			case subscription.ackQueue <- record.ID:
 			case <-subscriptionCtx.Done():
@@ -1436,6 +1368,6 @@ func prepareRedisStream(ctx context.Context, name string, config MQConfig) (prep
 	return preparedClient{
 		name: name, module: "mq", typ: string(config.Type),
 		commit: func() error { return resource.Set[coremq.MQ](name, mq) },
-		close:  func(context.Context) error { return mq.Close() },
+		close:  mq.closeContext,
 	}, nil
 }

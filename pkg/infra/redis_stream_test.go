@@ -723,11 +723,7 @@ func TestRedisStreamSubscriptionCancelDoesNotAck(t *testing.T) {
 	}
 	waitForSignal(t, handlerStarted)
 	cancel()
-	waitForCondition(t, func() bool {
-		mq.mu.Lock()
-		defer mq.mu.Unlock()
-		return len(mq.subscriptions) == 0
-	}, "subscription did not stop after context cancellation")
+	waitForCondition(t, func() bool { return mq.lifecycle.Active() == 0 }, "subscription did not stop after context cancellation")
 	if ids := store.ackedIDs(); len(ids) != 0 {
 		t.Fatalf("acked IDs = %v", ids)
 	}
@@ -741,11 +737,11 @@ func TestRedisStreamCloseDrainsStartedHandlerButLeavesQueuedPending(t *testing.T
 		testRedisStreamRecord(t, "1-0", &Message{}),
 		testRedisStreamRecord(t, "2-0", &Message{}),
 	}
-	var delivered atomic.Bool
+	var reads atomic.Int32
 	ackContextOK := atomic.Bool{}
 	store := &fakeRedisStreamStore{}
 	store.readFunc = func(ctx context.Context, _ string, _ string, _ string, _ int64, _ time.Duration) ([]redis.XMessage, error) {
-		if delivered.CompareAndSwap(false, true) {
+		if reads.Add(1) == 1 {
 			return records, nil
 		}
 		<-ctx.Done()
@@ -771,7 +767,8 @@ func TestRedisStreamCloseDrainsStartedHandlerButLeavesQueuedPending(t *testing.T
 		t.Fatal(err)
 	}
 	waitForSignal(t, started)
-	waitForCondition(t, func() bool { return redisStreamQueuedMessages(mq) == 1 }, "second message was not queued")
+	// 第二次 ReadGroup 发生在上一批全部入队之后，此时第二条消息还在队列里等待空闲 worker。
+	waitForCondition(t, func() bool { return reads.Load() >= 2 }, "second message was not queued")
 
 	closed := make(chan error, 1)
 	go func() { closed <- mq.Close() }()
@@ -1222,15 +1219,6 @@ func TestRedisStreamConsumerCleanupScopesCurrentAndStaleConsumers(t *testing.T) 
 	if !reflect.DeepEqual(calls, want) {
 		t.Fatalf("cleanup calls = %#v, want %#v", calls, want)
 	}
-}
-
-func redisStreamQueuedMessages(mq *redisStreamMQ) int {
-	mq.mu.Lock()
-	defer mq.mu.Unlock()
-	for subscription := range mq.subscriptions {
-		return len(subscription.queue)
-	}
-	return 0
 }
 
 func redisStreamTestID(value int) string {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -316,4 +317,171 @@ func splitKafkaBrokers(value string) []string {
 		}
 	}
 	return brokers
+}
+
+// TestKafkaConsumeStopIntegration 校验 Consume 的优雅停止：取消 Consume 的 ctx 不影响订阅；
+// Stop 等进行中的 Handler 跑完并确认，同组的新成员不会再收到这条消息；
+// Stop 超时则以 ErrClosed 取消 Handler，消息不确认，由同组的新成员重新处理。
+func TestKafkaConsumeStopIntegration(t *testing.T) {
+	tests := []struct {
+		name string
+		env  string
+		typ  MQType
+	}{
+		{name: "consumer-group", env: "KC_KAFKA_TEST_BROKERS", typ: MQTypeKafka},
+		{name: "share-group", env: "KC_KAFKA_SHARE_TEST_BROKERS", typ: MQTypeKafkaShare},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			brokers := splitKafkaBrokers(os.Getenv(test.env))
+			if len(brokers) == 0 {
+				t.Skipf("%s is not set", test.env)
+			}
+			t.Run("graceful", func(t *testing.T) { testKafkaConsumeStopIntegration(t, brokers, test.typ, false) })
+			t.Run("deadline", func(t *testing.T) { testKafkaConsumeStopIntegration(t, brokers, test.typ, true) })
+		})
+	}
+}
+
+func testKafkaConsumeStopIntegration(t *testing.T, brokers []string, typ MQType, forced bool) {
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	topic := "kc-consume-stop-" + suffix
+	group := "kc-consume-stop-" + suffix
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	createKafkaTestTopics(ctx, t, brokers, 1, topic, topic+kafkaDLQSuffix)
+	var options []coremq.SubscribeOption
+	if typ == MQTypeKafka {
+		options = append(options, coremq.WithKafkaStartOffset(coremq.KafkaStartOffsetEarliest))
+	} else {
+		setKafkaShareGroupsEarliest(ctx, t, brokers, group)
+	}
+	newMQ := func(name string) coremq.MQ {
+		t.Helper()
+		kafkaConfig := &KafkaConfig{
+			Brokers: brokers, ConsumerBatchSize: 8, Concurrency: 2, HandlerTimeout: 30 * time.Second,
+			RetryBackoff: 10 * time.Millisecond, RetryMaxBackoff: time.Second,
+		}
+		if typ == MQTypeKafka {
+			kafkaConfig.RebalanceTimeout = 10 * time.Second
+		}
+		if err := Init(ctx, Config{MQ: map[string]MQConfig{name: {Type: typ, Kafka: kafkaConfig}}}); err != nil {
+			t.Fatal(err)
+		}
+		mq, ok := resource.Get[coremq.MQ](name)
+		if !ok {
+			t.Fatal("Kafka MQ resource is missing")
+		}
+		t.Cleanup(func() { _ = mq.Close() })
+		return mq
+	}
+
+	mq := newMQ("infra-kafka-consume-stop-" + suffix)
+	consumeCtx, cancelConsume := context.WithCancel(ctx)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handlerErr := make(chan error, 1)
+	var calls atomic.Int32
+	subscription, err := mq.Consume(consumeCtx, topic, group, func(ctx context.Context, _ *coremq.Message) error {
+		if calls.Add(1) > 1 {
+			return nil
+		}
+		close(started)
+		if forced {
+			<-ctx.Done()
+			handlerErr <- context.Cause(ctx)
+			return ctx.Err()
+		}
+		<-release
+		handlerErr <- ctx.Err()
+		return nil
+	}, options...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mq.Publish(ctx, topic, &coremq.Message{Key: []byte("key"), Body: []byte("target")}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatalf("handler not started: %v", ctx.Err())
+	}
+	// Consume 的 ctx 只约束调用本身，取消后订阅和进行中的 Handler 都不受影响。
+	cancelConsume()
+
+	stopStarted := time.Now()
+	if forced {
+		stopCtx, cancelStop := context.WithTimeout(ctx, 500*time.Millisecond)
+		err := subscription.Stop(stopCtx)
+		cancelStop()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Stop = %v, want deadline exceeded", err)
+		}
+		if err := <-handlerErr; !errors.Is(err, coremq.ErrClosed) {
+			t.Fatalf("handler cancel cause = %v, want ErrClosed", err)
+		}
+	} else {
+		stopped := make(chan error, 1)
+		go func() { stopped <- subscription.Stop(ctx) }()
+		select {
+		case err := <-stopped:
+			t.Fatalf("Stop returned before handler finished: %v", err)
+		case <-time.After(time.Second):
+		}
+		close(release)
+		if err := <-stopped; err != nil {
+			t.Fatalf("Stop = %v", err)
+		}
+		if err := <-handlerErr; err != nil {
+			t.Fatalf("handler context canceled during graceful stop: %v", err)
+		}
+	}
+	t.Logf("Stop took %s", time.Since(stopStarted))
+	select {
+	case <-subscription.Done():
+	default:
+		t.Fatal("subscription not done after Stop")
+	}
+
+	// 同组的新成员：优雅停止时只应收到哨兵，强制停止时应重新收到 target。
+	verifier := newMQ("infra-kafka-consume-stop-verify-" + suffix)
+	received := make(chan string, 8)
+	verifySubscription, err := verifier.Consume(ctx, topic, group, func(_ context.Context, message *coremq.Message) error {
+		received <- string(message.Body)
+		return nil
+	}, options...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifier.Publish(ctx, topic, &coremq.Message{Key: []byte("key"), Body: []byte("sentinel")}); err != nil {
+		t.Fatal(err)
+	}
+	var bodies []string
+	for !slices.Contains(bodies, "sentinel") || (forced && !slices.Contains(bodies, "target")) {
+		select {
+		case body := <-received:
+			bodies = append(bodies, body)
+		case <-ctx.Done():
+			t.Fatalf("verifier received %v: %v", bodies, ctx.Err())
+		}
+	}
+	// 留出时间让可能的重复投递到达。
+	time.Sleep(2 * time.Second)
+	for len(received) > 0 {
+		bodies = append(bodies, <-received)
+	}
+	t.Logf("verifier received %v", bodies)
+	targets := 0
+	for _, body := range bodies {
+		if body == "target" {
+			targets++
+		}
+	}
+	if want := map[bool]int{false: 0, true: 1}[forced]; targets != want {
+		t.Fatalf("verifier received target %d times, want %d", targets, want)
+	}
+	if err := verifySubscription.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
 }
