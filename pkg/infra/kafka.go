@@ -12,7 +12,9 @@ import (
 
 	coremq "github.com/project-kgo/kc/pkg/mq"
 	"github.com/project-kgo/kc/pkg/resource"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 	"github.com/twmb/franz-go/pkg/sasl"
 	"github.com/twmb/franz-go/pkg/sasl/plain"
 	"github.com/twmb/franz-go/pkg/sasl/scram"
@@ -21,28 +23,39 @@ import (
 var _ coremq.MQ = (*kafkaMQ)(nil)
 
 const (
-	defaultKafkaConsumerBatchSize      = 100
-	defaultKafkaConcurrency            = 10
-	defaultKafkaHandlerTimeout         = 30 * time.Second
-	defaultKafkaShareHandlerTimeout    = 15 * time.Second
-	defaultKafkaShareDeliveryAttempts  = 4
-	defaultKafkaBatchProcessingTimeout = 45 * time.Second
-	defaultKafkaRebalanceTimeout       = 60 * time.Second
-	defaultKafkaRetryBackoff           = time.Second
-	defaultKafkaRetryMaxBackoff        = 30 * time.Second
-	kafkaMaxConsumerBatchSize          = 10000
-	kafkaMaxConcurrency                = 10000
-	kafkaMaxRetries                    = 10000
+	defaultKafkaConsumerBatchSize     = 100
+	defaultKafkaConcurrency           = 10
+	defaultKafkaHandlerTimeout        = 30 * time.Second
+	defaultKafkaShareHandlerTimeout   = 15 * time.Second
+	defaultKafkaShareDeliveryAttempts = 4
+	defaultKafkaShareConsumers        = 4
+	defaultKafkaRebalanceTimeout      = 60 * time.Second
+	defaultKafkaRetryBackoff          = time.Second
+	defaultKafkaRetryMaxBackoff       = 30 * time.Second
+	kafkaMaxConsumerBatchSize         = 10000
+	kafkaMaxConcurrency               = 10000
+	kafkaMaxRetries                   = 10000
+	kafkaMaxShareConsumers            = 64
 	// broker 投递上限为 5 时，应用最多在第 4 次投递写 DLQ，给 DLQ 故障保留一次重投机会。
 	kafkaBrokerShareDeliveryCountLimit = 5
 	kafkaMaxShareDeliveryAttempts      = kafkaBrokerShareDeliveryCountLimit - 1
-	kafkaDLQSuffix                     = ".dlq"
-	kafkaDLQHeaderSourceTopic          = "kc.dlq.source_topic"
-	kafkaDLQHeaderSourceGroup          = "kc.dlq.source_group"
-	kafkaDLQHeaderSourceMessageID      = "kc.dlq.source_message_id"
-	kafkaDLQHeaderDeliveryCount        = "kc.dlq.delivery_count"
-	kafkaDLQHeaderError                = "kc.dlq.error"
-	kafkaDLQHeaderFailedAt             = "kc.dlq.failed_at"
+	kafkaShareDeliveryLimitConfig      = "group.share.delivery.count.limit"
+	kafkaDLQProduceTimeout             = 10 * time.Second
+	kafkaCommitTimeout                 = 10 * time.Second
+	kafkaFlushAcksTimeout              = 10 * time.Second
+	kafkaTopicCheckTimeout             = 5 * time.Second
+	kafkaConsumerFetchMaxWait          = 500 * time.Millisecond
+	// broker 在发出响应前就开始计算锁期限，ack 回传也需要时间，处理截止时间要提前留出余量。
+	kafkaShareLockMargin = 3 * time.Second
+	// share 最后一次投递时为写 DLQ 预留的锁时间。
+	kafkaShareDLQReserve          = 5 * time.Second
+	kafkaDLQSuffix                = ".dlq"
+	kafkaDLQHeaderSourceTopic     = "kc.dlq.source_topic"
+	kafkaDLQHeaderSourceGroup     = "kc.dlq.source_group"
+	kafkaDLQHeaderSourceMessageID = "kc.dlq.source_message_id"
+	kafkaDLQHeaderDeliveryCount   = "kc.dlq.delivery_count"
+	kafkaDLQHeaderError           = "kc.dlq.error"
+	kafkaDLQHeaderFailedAt        = "kc.dlq.failed_at"
 )
 
 type kafkaGroupMode uint8
@@ -59,40 +72,49 @@ type kafkaProducer interface {
 
 type kafkaConsumer interface {
 	PollRecords(context.Context, int) kgo.Fetches
-	CommitRecords(context.Context, ...*kgo.Record) error
 	AllowRebalance()
+	PauseFetchPartitions(map[string][]int32) map[string][]int32
+	ResumeFetchPartitions(map[string][]int32)
+	MarkCommitRecords(...*kgo.Record)
+	CommitMarkedOffsets(context.Context) error
 	CloseAllowingRebalance()
 	FlushAcks(context.Context) error
 	Close()
 }
 
-type kafkaConsumerFactory func(topic, group string, config kafkaSubscriptionConfig) (kafkaConsumer, error)
+// kafkaGroupHooks 把 consumer group 的分区分配回调转交给订阅内的分区 worker 管理器。
+type kafkaGroupHooks struct {
+	assigned func(map[string][]int32)
+	revoked  func(map[string][]int32)
+	lost     func(map[string][]int32)
+}
+
+type kafkaConsumerSetup struct {
+	shareFetchLimit int
+	hooks           kafkaGroupHooks
+}
+
+type kafkaConsumerFactory func(topic, group string, config kafkaSubscriptionConfig, setup kafkaConsumerSetup) (kafkaConsumer, error)
+
+type kafkaTopicChecker func(ctx context.Context, topic string) (bool, error)
 
 type kafkaRuntimeConfig struct {
-	batchSize              int
-	concurrency            int
-	handlerTimeout         time.Duration
-	maxRetries             int
-	maxDeliveryAttempts    int
-	batchProcessingTimeout time.Duration
-	rebalanceTimeout       time.Duration
-	retryBackoff           time.Duration
-	retryMaxBackoff        time.Duration
-	logger                 *slog.Logger
+	batchSize           int
+	concurrency         int
+	handlerTimeout      time.Duration
+	maxRetries          int
+	maxDeliveryAttempts int
+	shareConsumers      int
+	rebalanceTimeout    time.Duration
+	retryBackoff        time.Duration
+	retryMaxBackoff     time.Duration
+	logger              *slog.Logger
 }
 
 type kafkaSubscriptionConfig struct {
 	kafkaRuntimeConfig
-	mode            kafkaGroupMode
-	batchController *kafkaBatchController
-	startOffset     *coremq.KafkaStartOffset
-}
-
-// kafkaBatchController 只中断 rebalance 当前阻塞的批次，不参与 MQ Close 的优雅关闭。
-type kafkaBatchController struct {
-	mu      sync.Mutex
-	cancel  context.CancelCauseFunc
-	pending error
+	mode        kafkaGroupMode
+	startOffset *coremq.KafkaStartOffset
 }
 
 type kafkaMQState uint8
@@ -104,8 +126,10 @@ const (
 )
 
 type kafkaSubscription struct {
-	stop context.CancelFunc
-	done chan struct{}
+	// stop 停止拉取新消息；abort 取消仍在执行的 Handler，只在关闭超时时使用。
+	stop  context.CancelFunc
+	abort context.CancelCauseFunc
+	done  chan struct{}
 }
 
 type kafkaMQ struct {
@@ -113,6 +137,10 @@ type kafkaMQ struct {
 	newConsumer kafkaConsumerFactory
 	config      kafkaRuntimeConfig
 	mode        kafkaGroupMode
+	// topicExists 为空时跳过订阅前的 DLQ topic 检查。
+	topicExists kafkaTopicChecker
+	// shareDeliveryLimit 是 broker 的 group.share.delivery.count.limit，0 表示未知。
+	shareDeliveryLimit int
 
 	mu            sync.Mutex
 	state         kafkaMQState
@@ -126,51 +154,20 @@ type kafkaPartitionKey struct {
 	partition int32
 }
 
-type kafkaPartitionResult struct {
-	lastTerminal *kgo.Record
-	err          error
+// kafkaSession 是一个 Kafka client 及绑定在它上面的消费循环。
+type kafkaSession struct {
+	consumer kafkaConsumer
+	consume  func(pollCtx context.Context) (bool, error)
 }
+
+type kafkaSessionFactory func() (kafkaSession, error)
 
 var (
-	errKafkaBatchProcessingTimeout = errors.New("kafka batch processing timeout")
-	errKafkaRebalanceBlocked       = errors.New("kafka rebalance callback blocked")
+	errKafkaPartitionRevoked  = errors.New("kafka partition revoked")
+	errKafkaPartitionLost     = errors.New("kafka partition lost")
+	errKafkaShareLockExpiring = errors.New("kafka share acquisition lock is expiring")
+	errKafkaDeliveryExhausted = errors.New("kafka share delivery attempts exhausted")
 )
-
-func (c *kafkaBatchController) start(cancel context.CancelCauseFunc) {
-	c.mu.Lock()
-	c.cancel = cancel
-	pending := c.pending
-	c.pending = nil
-	c.mu.Unlock()
-	// callback 可能恰好发生在 PollRecords 返回后、批次注册取消函数前。
-	if pending != nil {
-		cancel(pending)
-	}
-}
-
-func (c *kafkaBatchController) finish() {
-	c.mu.Lock()
-	c.cancel = nil
-	c.mu.Unlock()
-}
-
-func (c *kafkaBatchController) interrupt(cause error) {
-	c.mu.Lock()
-	cancel := c.cancel
-	if cancel == nil {
-		c.pending = cause
-	}
-	c.mu.Unlock()
-	if cancel != nil {
-		cancel(cause)
-	}
-}
-
-func (c *kafkaBatchController) reset() {
-	c.mu.Lock()
-	c.pending = nil
-	c.mu.Unlock()
-}
 
 func newKafkaMQ(
 	producer kafkaProducer,
@@ -238,37 +235,60 @@ func (m *kafkaMQ) Subscribe(
 	if err != nil {
 		return fmt.Errorf("subscribe kafka: %w", err)
 	}
-	if config.mode == kafkaConsumerGroup {
-		config.batchController = &kafkaBatchController{}
-	}
 	if !m.beginOperation() {
 		return coremq.ErrClosed
 	}
 	defer m.endOperation()
 
-	consumer, err := m.newConsumer(topic, group, config)
-	if err != nil {
-		return fmt.Errorf("create kafka consumer: %w", err)
+	if err := m.checkDeadLetterTopic(ctx, topic, config); err != nil {
+		return fmt.Errorf("subscribe kafka: %w", err)
 	}
+
 	pollCtx, stop := context.WithCancel(ctx)
-	subscription := &kafkaSubscription{stop: stop, done: make(chan struct{})}
-	if !m.trackSubscription(subscription) {
+	workCtx, abort := context.WithCancelCause(ctx)
+	subscription := &kafkaSubscription{stop: stop, abort: abort, done: make(chan struct{})}
+	factories := m.sessionFactories(workCtx, topic, group, handler, config)
+	sessions := make([]kafkaSession, 0, len(factories))
+	closeSessions := func(cause error) {
 		stop()
-		_ = closeKafkaConsumer(consumer, config.mode, config.retryMaxBackoff)
+		abort(cause)
+		for _, session := range sessions {
+			_ = closeKafkaConsumer(session.consumer, config.mode)
+		}
+	}
+	for _, factory := range factories {
+		session, err := factory()
+		if err != nil {
+			closeSessions(err)
+			return fmt.Errorf("create kafka consumer: %w", err)
+		}
+		sessions = append(sessions, session)
+	}
+	if !m.trackSubscription(subscription) {
+		closeSessions(coremq.ErrClosed)
 		return coremq.ErrClosed
 	}
 
-	go m.runSubscription(pollCtx, ctx, topic, group, handler, config, subscription, consumer)
+	go m.runSubscription(pollCtx, topic, group, config, subscription, factories, sessions)
 	return nil
 }
 
 func (m *kafkaMQ) Close() error {
+	return m.closeContext(context.Background())
+}
+
+// closeContext 停止拉取并等待已经开始的 Handler 和确认完成；ctx 结束后取消仍在执行的 Handler 再继续等待。
+func (m *kafkaMQ) closeContext(ctx context.Context) error {
 	m.mu.Lock()
 	if m.state != kafkaMQOpen {
 		done := m.closeDone
 		m.mu.Unlock()
-		<-done
-		return nil
+		select {
+		case <-done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	m.state = kafkaMQClosing
 	subscriptions := make([]*kafkaSubscription, 0, len(m.subscriptions))
@@ -278,9 +298,21 @@ func (m *kafkaMQ) Close() error {
 	}
 	m.mu.Unlock()
 
-	m.operations.Wait()
-	for _, subscription := range subscriptions {
-		<-subscription.done
+	stopped := make(chan struct{})
+	go func() {
+		m.operations.Wait()
+		for _, subscription := range subscriptions {
+			<-subscription.done
+		}
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-ctx.Done():
+		for _, subscription := range subscriptions {
+			subscription.abort(coremq.ErrClosed)
+		}
+		<-stopped
 	}
 	m.producer.Close()
 
@@ -321,33 +353,116 @@ func (m *kafkaMQ) untrackSubscription(subscription *kafkaSubscription) {
 	m.mu.Unlock()
 }
 
-func (m *kafkaMQ) runSubscription(
-	pollCtx context.Context,
-	handlerCtx context.Context,
+// checkDeadLetterTopic 在订阅前确认 DLQ topic 存在。producer 不自动建 topic，
+// DLQ 缺失时传统组会卡住毒消息所在分区，share group 会在投递次数耗尽后被 broker 丢弃。
+func (m *kafkaMQ) checkDeadLetterTopic(ctx context.Context, topic string, config kafkaSubscriptionConfig) error {
+	if m.topicExists == nil {
+		return nil
+	}
+	dlqTopic := topic + kafkaDLQSuffix
+	checkCtx, cancel := context.WithTimeout(ctx, kafkaTopicCheckTimeout)
+	exists, err := m.topicExists(checkCtx, dlqTopic)
+	cancel()
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		// 网络或权限问题不阻断订阅，运行期写 DLQ 失败时仍按各模式的策略重试。
+		kafkaLogger(config).WarnContext(ctx, "检查 Kafka DLQ topic 失败",
+			"topic", topic, "dlq_topic", dlqTopic, "error", err)
+		return nil
+	}
+	if !exists {
+		return fmt.Errorf("%w: kafka dlq topic %q does not exist", coremq.ErrInvalidArgument, dlqTopic)
+	}
+	return nil
+}
+
+func (m *kafkaMQ) sessionFactories(
+	workCtx context.Context,
 	topic string,
 	group string,
 	handler coremq.Handler,
 	config kafkaSubscriptionConfig,
-	subscription *kafkaSubscription,
-	consumer kafkaConsumer,
-) {
-	defer func() {
-		m.untrackSubscription(subscription)
-		close(subscription.done)
-	}()
+) []kafkaSessionFactory {
+	if config.mode == kafkaShareGroup {
+		limits := kafkaShareConsumerLimits(config)
+		factories := make([]kafkaSessionFactory, 0, len(limits))
+		for _, limit := range limits {
+			factories = append(factories, func() (kafkaSession, error) {
+				consumer, err := m.newConsumer(topic, group, config, kafkaConsumerSetup{shareFetchLimit: limit})
+				if err != nil {
+					return kafkaSession{}, err
+				}
+				return kafkaSession{consumer: consumer, consume: func(pollCtx context.Context) (bool, error) {
+					return m.consumeShareGroup(pollCtx, workCtx, topic, group, consumer, handler, config, limit)
+				}}, nil
+			})
+		}
+		return factories
+	}
 
+	// 并发槽位在 client 重建之间共享，保证同一订阅的 Handler 并发始终不超过 concurrency。
+	slots := make(chan struct{}, config.concurrency)
+	return []kafkaSessionFactory{func() (kafkaSession, error) {
+		runner := newKafkaGroupRunner(m, workCtx, topic, group, handler, config, slots)
+		consumer, err := m.newConsumer(topic, group, config, kafkaConsumerSetup{hooks: runner.hooks()})
+		if err != nil {
+			return kafkaSession{}, err
+		}
+		return kafkaSession{consumer: consumer, consume: func(pollCtx context.Context) (bool, error) {
+			return runner.consume(pollCtx, consumer)
+		}}, nil
+	}}
+}
+
+func (m *kafkaMQ) runSubscription(
+	pollCtx context.Context,
+	topic string,
+	group string,
+	config kafkaSubscriptionConfig,
+	subscription *kafkaSubscription,
+	factories []kafkaSessionFactory,
+	sessions []kafkaSession,
+) {
+	var instances sync.WaitGroup
+	for index, session := range sessions {
+		instances.Add(1)
+		go func() {
+			defer instances.Done()
+			m.runSession(pollCtx, topic, group, config, factories[index], session)
+		}()
+	}
+	instances.Wait()
+
+	subscription.stop()
+	subscription.abort(context.Canceled)
+	m.untrackSubscription(subscription)
+	close(subscription.done)
+}
+
+// runSession 只在 client 不可用时重建；单条消息失败、DLQ 失败或重平衡都在 client 内部处理，不会退出消费组。
+func (m *kafkaMQ) runSession(
+	pollCtx context.Context,
+	topic string,
+	group string,
+	config kafkaSubscriptionConfig,
+	factory kafkaSessionFactory,
+	session kafkaSession,
+) {
+	logCtx := context.WithoutCancel(pollCtx)
 	retryAttempt := 0
 	for {
-		stable, err := m.consume(pollCtx, handlerCtx, topic, group, consumer, handler, config)
-		if closeErr := closeKafkaConsumer(consumer, config.mode, config.retryMaxBackoff); closeErr != nil {
-			kafkaLogger(config).ErrorContext(context.WithoutCancel(handlerCtx), "关闭 Kafka consumer 失败",
+		stable, err := session.consume(pollCtx)
+		if closeErr := closeKafkaConsumer(session.consumer, config.mode); closeErr != nil {
+			kafkaLogger(config).ErrorContext(logCtx, "关闭 Kafka consumer 失败",
 				"topic", topic, "group", group, "error", closeErr)
 		}
 		if pollCtx.Err() != nil {
 			return
 		}
 		if err != nil {
-			kafkaLogger(config).ErrorContext(context.WithoutCancel(handlerCtx), "Kafka 消费循环中断",
+			kafkaLogger(config).ErrorContext(logCtx, "Kafka 消费循环中断",
 				"topic", topic, "group", group, "error", err)
 		}
 		if stable {
@@ -359,246 +474,494 @@ func (m *kafkaMQ) runSubscription(
 				return
 			}
 			retryAttempt++
-			consumer, err = m.newConsumer(topic, group, config)
+			session, err = factory()
 			if err == nil {
 				break
 			}
-			kafkaLogger(config).ErrorContext(context.WithoutCancel(handlerCtx), "重建 Kafka consumer 失败",
+			kafkaLogger(config).ErrorContext(logCtx, "重建 Kafka consumer 失败",
 				"topic", topic, "group", group, "error", err)
 		}
 	}
 }
 
-func (m *kafkaMQ) consume(
-	pollCtx context.Context,
-	handlerCtx context.Context,
-	topic string,
-	group string,
-	consumer kafkaConsumer,
-	handler coremq.Handler,
-	config kafkaSubscriptionConfig,
-) (bool, error) {
-	if config.mode == kafkaShareGroup {
-		return m.consumeShareGroup(pollCtx, handlerCtx, topic, group, consumer, handler, config)
-	}
-	return m.consumeConsumerGroup(pollCtx, handlerCtx, topic, group, consumer, handler, config)
+// kafkaGroupRunner 为传统 consumer group 的每个已分配分区维护一个串行 worker。
+// 拉取循环只负责分发，分区之间互不阻塞；分区积压达到 2*batchSize 时暂停拉取该分区，
+// 剩余 batchSize 条时恢复，让恢复后的存量工作覆盖下一次拉取的往返时间。
+// 处理完成的消息通过 MarkCommitRecords 交给后台自动提交；分区被回收时先停止对应 worker，
+// 再同步提交，避免把不属于自己的分区提交回退。
+type kafkaGroupRunner struct {
+	m       *kafkaMQ
+	workCtx context.Context
+	topic   string
+	group   string
+	handler coremq.Handler
+	config  kafkaSubscriptionConfig
+	slots   chan struct{}
+
+	mu       sync.Mutex
+	consumer kafkaConsumer
+	workers  map[kafkaPartitionKey]*kafkaPartitionWorker
+	closed   bool
 }
 
-func (m *kafkaMQ) consumeConsumerGroup(
-	pollCtx context.Context,
-	handlerCtx context.Context,
+func newKafkaGroupRunner(
+	m *kafkaMQ,
+	workCtx context.Context,
 	topic string,
 	group string,
-	consumer kafkaConsumer,
 	handler coremq.Handler,
 	config kafkaSubscriptionConfig,
-) (bool, error) {
+	slots chan struct{},
+) *kafkaGroupRunner {
+	return &kafkaGroupRunner{
+		m: m, workCtx: workCtx, topic: topic, group: group, handler: handler, config: config, slots: slots,
+		workers: make(map[kafkaPartitionKey]*kafkaPartitionWorker),
+	}
+}
+
+func (r *kafkaGroupRunner) hooks() kafkaGroupHooks {
+	return kafkaGroupHooks{assigned: r.assign, revoked: r.revoke, lost: r.lose}
+}
+
+// client 返回绑定的 consumer。分配回调可能早于 consume 开始，此时还没有消息需要处理。
+func (r *kafkaGroupRunner) client() kafkaConsumer {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.consumer
+}
+
+func (r *kafkaGroupRunner) consume(pollCtx context.Context, consumer kafkaConsumer) (bool, error) {
+	r.mu.Lock()
+	r.consumer = consumer
+	r.mu.Unlock()
+	defer r.shutdown()
+
 	stable := false
+	failures := 0
 	for {
-		if config.batchController != nil {
-			config.batchController.reset()
-		}
-		fetches := consumer.PollRecords(pollCtx, config.batchSize)
-		if err := fetches.Err(); err != nil {
-			if ctxErr := pollCtx.Err(); ctxErr != nil {
-				return stable, ctxErr
-			}
-			return stable, wrapKafkaError("poll kafka message", err)
-		}
-		records := fetches.Records()
-		if len(records) == 0 {
-			continue
-		}
+		fetches := consumer.PollRecords(pollCtx, r.config.batchSize)
 		if err := pollCtx.Err(); err != nil {
 			consumer.AllowRebalance()
 			return stable, err
 		}
-
-		results := m.processConsumerGroupBatch(pollCtx, handlerCtx, topic, group, records, handler, config)
-		commits := make([]*kgo.Record, 0, len(results))
-		var batchErr error
-		for _, result := range results {
-			if result.lastTerminal != nil {
-				commits = append(commits, result.lastTerminal)
-			}
-			if batchErr == nil && result.err != nil {
-				batchErr = result.err
-			}
-		}
-		if len(commits) > 0 {
-			commitCtx, cancel := context.WithTimeout(context.WithoutCancel(handlerCtx), kafkaConsumerGroupCommitTimeout(config))
-			err := consumer.CommitRecords(commitCtx, commits...)
-			cancel()
-			if err != nil {
-				consumer.AllowRebalance()
-				return stable, wrapKafkaError("commit kafka messages", err)
-			}
-		}
+		// BlockRebalanceOnPoll 只覆盖内存分发这一小段，保证旧会话拉到的消息不会投递给重新分配后的 worker。
+		dispatched := r.dispatch(consumer, fetches)
 		consumer.AllowRebalance()
-		if err := pollCtx.Err(); err != nil {
-			return stable, err
+
+		closed, failed := logKafkaPollErrors(r.config, r.topic, r.group, fetches)
+		if closed {
+			return stable, wrapKafkaError("poll kafka message", kgo.ErrClientClosed)
 		}
-		if batchErr != nil {
-			return stable, batchErr
+		if dispatched > 0 {
+			stable = true
+			failures = 0
+			continue
 		}
-		stable = true
+		if failed {
+			if !waitKafkaRetry(pollCtx, kafkaRetryDelay(r.config.retryBackoff, r.config.retryMaxBackoff, failures)) {
+				return stable, pollCtx.Err()
+			}
+			failures++
+		}
 	}
 }
 
-func (m *kafkaMQ) processConsumerGroupBatch(
-	pollCtx context.Context,
-	handlerCtx context.Context,
-	topic string,
-	group string,
-	records []*kgo.Record,
-	handler coremq.Handler,
-	config kafkaSubscriptionConfig,
-) []kafkaPartitionResult {
-	deadlineCtx, stopDeadline := context.WithTimeoutCause(handlerCtx, config.batchProcessingTimeout, errKafkaBatchProcessingTimeout)
-	batchCtx, stopBatch := context.WithCancelCause(deadlineCtx)
-	if config.batchController != nil {
-		config.batchController.start(stopBatch)
-		defer config.batchController.finish()
-	}
-	defer stopBatch(nil)
-	defer stopDeadline()
-
-	partitions := make(map[kafkaPartitionKey][]*kgo.Record)
-	order := make([]kafkaPartitionKey, 0)
-	for _, record := range records {
-		key := kafkaPartitionKey{topic: record.Topic, partition: record.Partition}
-		if _, exists := partitions[key]; !exists {
-			order = append(order, key)
+func (r *kafkaGroupRunner) dispatch(consumer kafkaConsumer, fetches kgo.Fetches) int {
+	dispatched := 0
+	fetches.EachPartition(func(partition kgo.FetchTopicPartition) {
+		if len(partition.Records) == 0 {
+			return
 		}
-		partitions[key] = append(partitions[key], record)
-	}
-
-	results := make(chan kafkaPartitionResult, len(order))
-	semaphore := make(chan struct{}, config.concurrency)
-	var workers sync.WaitGroup
-	for _, key := range order {
-		partition := partitions[key]
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-			var result kafkaPartitionResult
-			select {
-			case semaphore <- struct{}{}:
-				defer func() { <-semaphore }()
-			case <-batchCtx.Done():
-				result.err = context.Cause(batchCtx)
-				results <- result
-				return
-			case <-pollCtx.Done():
-				results <- result
-				return
-			}
-			for _, record := range partition {
-				if err := batchCtx.Err(); err != nil {
-					result.err = context.Cause(batchCtx)
-					break
-				}
-				if pollCtx.Err() != nil {
-					break
-				}
-				if err := m.processConsumerGroupRecord(pollCtx, batchCtx, topic, group, record, handler, config); err != nil {
-					result.err = err
-					break
-				}
-				result.lastTerminal = record
-			}
-			results <- result
-		}()
-	}
-	workers.Wait()
-	close(results)
-
-	batchResults := make([]kafkaPartitionResult, 0, len(order))
-	for result := range results {
-		batchResults = append(batchResults, result)
-	}
-	return batchResults
+		r.mu.Lock()
+		worker := r.workers[kafkaPartitionKey{topic: partition.Topic, partition: partition.Partition}]
+		r.mu.Unlock()
+		if worker == nil {
+			// 分区已被回收，未处理的消息会由新的持有者从已提交位置重新拉取。
+			return
+		}
+		worker.enqueue(consumer, partition.Records, 2*r.config.batchSize)
+		dispatched += len(partition.Records)
+	})
+	return dispatched
 }
 
-func (m *kafkaMQ) processConsumerGroupRecord(
-	pollCtx context.Context,
-	handlerCtx context.Context,
-	topic string,
-	group string,
-	record *kgo.Record,
-	handler coremq.Handler,
-	config kafkaSubscriptionConfig,
-) error {
+func (r *kafkaGroupRunner) assign(partitions map[string][]int32) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return
+	}
+	if r.consumer != nil {
+		r.consumer.ResumeFetchPartitions(partitions)
+	}
+	for topic, ids := range partitions {
+		for _, id := range ids {
+			key := kafkaPartitionKey{topic: topic, partition: id}
+			if _, exists := r.workers[key]; exists {
+				continue
+			}
+			worker := newKafkaPartitionWorker(r.workCtx, topic, id)
+			r.workers[key] = worker
+			go r.runWorker(worker)
+		}
+	}
+}
+
+// revoke 在 rebalanceTimeout 内交出分区：前一半时间等待进行中的消息自然完成，
+// 随后取消 Handler，最后把已完成的位置同步提交。
+func (r *kafkaGroupRunner) revoke(partitions map[string][]int32) {
+	workers := r.detach(partitions)
+	now := time.Now()
+	budget := r.config.rebalanceTimeout
+	r.stopWorkers(workers, now.Add(budget/2), now.Add(budget*3/4), errKafkaPartitionRevoked)
+	r.resume(partitions)
+	r.commit(min(kafkaCommitTimeout, budget/4))
+}
+
+// lose 处理成员已被踢出消费组的情况：此时提交必然失败，只需尽快停止处理。
+func (r *kafkaGroupRunner) lose(partitions map[string][]int32) {
+	workers := r.detach(partitions)
+	for _, worker := range workers {
+		worker.cancel(errKafkaPartitionLost)
+	}
+	deadline := time.Now().Add(r.config.rebalanceTimeout / 4)
+	r.stopWorkers(workers, deadline, deadline, errKafkaPartitionLost)
+	r.resume(partitions)
+}
+
+func (r *kafkaGroupRunner) shutdown() {
+	r.mu.Lock()
+	r.closed = true
+	workers := make([]*kafkaPartitionWorker, 0, len(r.workers))
+	for key, worker := range r.workers {
+		workers = append(workers, worker)
+		delete(r.workers, key)
+	}
+	r.mu.Unlock()
+
+	// 关闭时不限时等待进行中的 Handler，超时由 closeContext 通过 workCtx 取消。
+	r.stopWorkers(workers, time.Time{}, time.Time{}, coremq.ErrClosed)
+	r.commit(kafkaCommitTimeout)
+}
+
+func (r *kafkaGroupRunner) detach(partitions map[string][]int32) []*kafkaPartitionWorker {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var workers []*kafkaPartitionWorker
+	for topic, ids := range partitions {
+		for _, id := range ids {
+			key := kafkaPartitionKey{topic: topic, partition: id}
+			if worker, exists := r.workers[key]; exists {
+				workers = append(workers, worker)
+				delete(r.workers, key)
+			}
+		}
+	}
+	return workers
+}
+
+func (r *kafkaGroupRunner) stopWorkers(workers []*kafkaPartitionWorker, graceful, forced time.Time, cause error) {
+	for _, worker := range workers {
+		worker.stop()
+	}
+	if !waitKafkaWorkers(workers, graceful) {
+		for _, worker := range workers {
+			worker.cancel(cause)
+		}
+		if !waitKafkaWorkers(workers, forced) {
+			kafkaLogger(r.config).Warn("Kafka Handler 未及时响应取消，分区已交出，可能产生重复处理",
+				"topic", r.topic, "group", r.group, "error", cause)
+		}
+	}
+	// 交出后不再标记 offset，避免仍未返回的 Handler 回退其他成员的提交。
+	for _, worker := range workers {
+		worker.markRevoked()
+	}
+}
+
+func (r *kafkaGroupRunner) resume(partitions map[string][]int32) {
+	if len(partitions) == 0 {
+		return
+	}
+	if consumer := r.client(); consumer != nil {
+		consumer.ResumeFetchPartitions(partitions)
+	}
+}
+
+func (r *kafkaGroupRunner) commit(timeout time.Duration) {
+	consumer := r.client()
+	if consumer == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	err := consumer.CommitMarkedOffsets(ctx)
+	cancel()
+	if err != nil {
+		kafkaLogger(r.config).Error("提交 Kafka offset 失败",
+			"topic", r.topic, "group", r.group, "error", err)
+	}
+}
+
+func (r *kafkaGroupRunner) runWorker(worker *kafkaPartitionWorker) {
+	defer close(worker.done)
+	defer worker.cancel(context.Canceled)
+	resumeAt := r.config.batchSize
+	for {
+		record, ok := worker.next(r.client(), resumeAt)
+		if !ok || !worker.acquire(r.slots) {
+			return
+		}
+		terminal := r.process(worker, record)
+		<-r.slots
+		if !terminal {
+			return
+		}
+		worker.complete(r.client(), record)
+	}
+}
+
+// process 返回 true 表示消息已成功处理或已写入 DLQ，可以提交；返回 false 表示 worker 被停止。
+func (r *kafkaGroupRunner) process(worker *kafkaPartitionWorker, record *kgo.Record) bool {
+	logger := kafkaLogger(r.config)
+	logCtx := context.WithoutCancel(worker.ctx)
 	message := messageFromKafkaRecord(record)
 	var handlerErr error
-	for attempt := 0; attempt <= config.maxRetries; attempt++ {
-		handlerErr = handleKafkaMessage(handlerCtx, handler, message, config.handlerTimeout)
+	for attempt := 0; ; attempt++ {
+		handlerErr = handleKafkaMessage(worker.ctx, r.handler, message, r.config.handlerTimeout)
 		if handlerErr == nil {
-			return nil
+			return true
 		}
-		if err := handlerCtx.Err(); err != nil {
-			return context.Cause(handlerCtx)
+		if worker.ctx.Err() != nil {
+			return false
 		}
-		if err := pollCtx.Err(); err != nil {
-			return err
-		}
-		kafkaLogger(config).WarnContext(context.WithoutCancel(handlerCtx), "处理 Kafka 消息失败",
-			"topic", topic, "group", group, "message_id", message.ID,
+		logger.WarnContext(logCtx, "处理 Kafka 消息失败",
+			"topic", r.topic, "group", r.group, "message_id", message.ID,
 			"attempt", attempt+1, "error", handlerErr)
-		if attempt < config.maxRetries &&
-			!waitKafkaRetryUntil(pollCtx, handlerCtx, kafkaRetryDelay(config.retryBackoff, config.retryMaxBackoff, attempt)) {
-			if err := handlerCtx.Err(); err != nil {
-				return context.Cause(handlerCtx)
-			}
-			return pollCtx.Err()
+		if attempt >= r.config.maxRetries {
+			break
+		}
+		if !worker.wait(kafkaRetryDelay(r.config.retryBackoff, r.config.retryMaxBackoff, attempt)) {
+			return false
 		}
 	}
 
-	deliveryCount := int64(config.maxRetries + 1)
-	if err := m.publishKafkaDLQ(handlerCtx, topic, group, record, deliveryCount, handlerErr, config); err != nil {
-		return fmt.Errorf("write kafka dlq for message %s: %w", message.ID, err)
+	deliveryCount := int64(r.config.maxRetries + 1)
+	for attempt := 0; ; attempt++ {
+		err := r.m.publishKafkaDLQ(worker.ctx, r.topic, r.group, record, deliveryCount, handlerErr, r.config)
+		if err == nil {
+			return true
+		}
+		if worker.ctx.Err() != nil {
+			return false
+		}
+		// DLQ 不可用时只阻塞当前分区，其余分区照常消费；分区被回收后由新的持有者重新处理。
+		logger.ErrorContext(logCtx, "写入 Kafka DLQ 失败，稍后重试",
+			"topic", r.topic, "group", r.group, "message_id", message.ID,
+			"attempt", attempt+1, "error", err)
+		if !worker.wait(kafkaRetryDelay(r.config.retryBackoff, r.config.retryMaxBackoff, attempt)) {
+			return false
+		}
 	}
-	return nil
 }
 
+// kafkaPartitionWorker 串行处理单个分区的消息，保证分区内顺序和连续提交。
+type kafkaPartitionWorker struct {
+	topic     string
+	partition int32
+	ctx       context.Context
+	cancel    context.CancelCauseFunc
+	stopping  chan struct{}
+	stopOnce  sync.Once
+	notify    chan struct{}
+	done      chan struct{}
+
+	// mu 同时保护队列和暂停状态，使暂停与恢复拉取的调用顺序与队列变化一致。
+	mu      sync.Mutex
+	queue   []*kgo.Record
+	paused  bool
+	revoked bool
+}
+
+func newKafkaPartitionWorker(parent context.Context, topic string, partition int32) *kafkaPartitionWorker {
+	ctx, cancel := context.WithCancelCause(parent)
+	return &kafkaPartitionWorker{
+		topic: topic, partition: partition, ctx: ctx, cancel: cancel,
+		stopping: make(chan struct{}), notify: make(chan struct{}, 1), done: make(chan struct{}),
+	}
+}
+
+func (w *kafkaPartitionWorker) partitions() map[string][]int32 {
+	return map[string][]int32{w.topic: {w.partition}}
+}
+
+func (w *kafkaPartitionWorker) enqueue(consumer kafkaConsumer, records []*kgo.Record, pauseAt int) {
+	w.mu.Lock()
+	if w.revoked {
+		w.mu.Unlock()
+		return
+	}
+	w.queue = append(w.queue, records...)
+	if !w.paused && len(w.queue) >= pauseAt {
+		// 暂停后 client 会丢弃该分区已缓冲的数据并保留拉取位置，恢复后从队尾之后继续拉取。
+		w.paused = true
+		consumer.PauseFetchPartitions(w.partitions())
+	}
+	w.mu.Unlock()
+	select {
+	case w.notify <- struct{}{}:
+	default:
+	}
+}
+
+func (w *kafkaPartitionWorker) next(consumer kafkaConsumer, resumeAt int) (*kgo.Record, bool) {
+	for {
+		if w.stopped() {
+			return nil, false
+		}
+		w.mu.Lock()
+		if len(w.queue) > 0 {
+			record := w.queue[0]
+			w.queue[0] = nil
+			w.queue = w.queue[1:]
+			if w.paused && len(w.queue) <= resumeAt {
+				w.paused = false
+				consumer.ResumeFetchPartitions(w.partitions())
+			}
+			w.mu.Unlock()
+			return record, true
+		}
+		w.queue = nil
+		w.mu.Unlock()
+
+		select {
+		case <-w.notify:
+		case <-w.stopping:
+			return nil, false
+		case <-w.ctx.Done():
+			return nil, false
+		}
+	}
+}
+
+func (w *kafkaPartitionWorker) acquire(slots chan struct{}) bool {
+	select {
+	case slots <- struct{}{}:
+		if w.stopped() || w.ctx.Err() != nil {
+			<-slots
+			return false
+		}
+		return true
+	case <-w.stopping:
+		return false
+	case <-w.ctx.Done():
+		return false
+	}
+}
+
+func (w *kafkaPartitionWorker) complete(consumer kafkaConsumer, record *kgo.Record) {
+	w.mu.Lock()
+	if !w.revoked {
+		consumer.MarkCommitRecords(record)
+	}
+	w.mu.Unlock()
+}
+
+func (w *kafkaPartitionWorker) wait(delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-w.stopping:
+		return false
+	case <-w.ctx.Done():
+		return false
+	}
+}
+
+// stop 让 worker 处理完当前消息后退出，不再开始新的消息或重试。
+func (w *kafkaPartitionWorker) stop() {
+	w.stopOnce.Do(func() { close(w.stopping) })
+}
+
+func (w *kafkaPartitionWorker) stopped() bool {
+	select {
+	case <-w.stopping:
+		return true
+	default:
+		return false
+	}
+}
+
+func (w *kafkaPartitionWorker) markRevoked() {
+	w.mu.Lock()
+	w.revoked = true
+	w.queue = nil
+	w.mu.Unlock()
+}
+
+func waitKafkaWorkers(workers []*kafkaPartitionWorker, deadline time.Time) bool {
+	var timeout <-chan time.Time
+	if !deadline.IsZero() {
+		timer := time.NewTimer(time.Until(deadline))
+		defer timer.Stop()
+		timeout = timer.C
+	}
+	for _, worker := range workers {
+		select {
+		case <-worker.done:
+		case <-timeout:
+			return false
+		}
+	}
+	return true
+}
+
+// consumeShareGroup 驱动一个 share consumer。franz-go 在下一次 PollRecords 时会自动接受上一批未确认的消息，
+// 因此必须等本批全部确认后才能再次拉取；订阅通过多个 share consumer 并行来摊薄慢消息造成的空闲槽位。
 func (m *kafkaMQ) consumeShareGroup(
 	pollCtx context.Context,
-	handlerCtx context.Context,
+	workCtx context.Context,
 	topic string,
 	group string,
 	consumer kafkaConsumer,
 	handler coremq.Handler,
 	config kafkaSubscriptionConfig,
+	limit int,
 ) (bool, error) {
 	stable := false
-	limit := kafkaShareFetchLimit(config)
+	failures := 0
 	for {
 		fetches := consumer.PollRecords(pollCtx, limit)
-		if err := fetches.Err(); err != nil {
-			if ctxErr := pollCtx.Err(); ctxErr != nil {
-				return stable, ctxErr
-			}
-			return stable, wrapKafkaError("poll kafka share message", err)
-		}
 		records := fetches.Records()
-		if len(records) == 0 {
+		if err := pollCtx.Err(); err != nil {
+			for _, record := range records {
+				record.Ack(kgo.AckRelease)
+			}
+			return stable, err
+		}
+		closed, failed := logKafkaPollErrors(config, topic, group, fetches)
+		if closed {
+			return stable, wrapKafkaError("poll kafka share message", kgo.ErrClientClosed)
+		}
+		if len(records) > 0 {
+			m.processShareGroupBatch(pollCtx, workCtx, topic, group, records, handler, config)
+			stable = true
+			failures = 0
 			continue
 		}
-		if err := pollCtx.Err(); err != nil {
-			return stable, err
+		if failed {
+			if !waitKafkaRetry(pollCtx, kafkaRetryDelay(config.retryBackoff, config.retryMaxBackoff, failures)) {
+				return stable, pollCtx.Err()
+			}
+			failures++
 		}
-
-		m.processShareGroupBatch(pollCtx, handlerCtx, topic, group, records, handler, config)
-		if err := pollCtx.Err(); err != nil {
-			return stable, err
-		}
-		stable = true
 	}
 }
 
 func (m *kafkaMQ) processShareGroupBatch(
 	pollCtx context.Context,
-	handlerCtx context.Context,
+	workCtx context.Context,
 	topic string,
 	group string,
 	records []*kgo.Record,
@@ -614,54 +977,81 @@ func (m *kafkaMQ) processShareGroupBatch(
 				record.Ack(kgo.AckRelease)
 				return
 			}
-			status := m.processShareGroupRecord(pollCtx, handlerCtx, topic, group, record, handler, config)
-			record.Ack(status)
+			record.Ack(m.processShareGroupRecord(
+				pollCtx, workCtx, topic, group, record,
+				record.DeliveryCount(), record.AcquisitionDeadline(), handler, config,
+			))
 		}()
 	}
 	workers.Wait()
 }
 
+// processShareGroupRecord 在 broker 的获取锁期限内完成处理和确认。lockDeadline 为零表示期限未知。
 func (m *kafkaMQ) processShareGroupRecord(
 	pollCtx context.Context,
-	handlerCtx context.Context,
-	topic string,
-	group string,
-	record *kgo.Record,
-	handler coremq.Handler,
-	config kafkaSubscriptionConfig,
-) kgo.AckStatus {
-	return m.processShareGroupRecordWithDelivery(
-		pollCtx, handlerCtx, topic, group, record, record.DeliveryCount(), handler, config,
-	)
-}
-
-func (m *kafkaMQ) processShareGroupRecordWithDelivery(
-	pollCtx context.Context,
-	handlerCtx context.Context,
+	workCtx context.Context,
 	topic string,
 	group string,
 	record *kgo.Record,
 	deliveryCount int32,
+	lockDeadline time.Time,
 	handler coremq.Handler,
 	config kafkaSubscriptionConfig,
 ) kgo.AckStatus {
+	logger := kafkaLogger(config)
+	logCtx := context.WithoutCancel(workCtx)
 	message := messageFromKafkaRecord(record)
-	handlerErr := handleKafkaMessage(handlerCtx, handler, message, config.handlerTimeout)
-	if handlerErr == nil {
-		return kgo.AckAccept
+	ctx := workCtx
+	if !lockDeadline.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadlineCause(workCtx, lockDeadline.Add(-kafkaShareLockMargin), errKafkaShareLockExpiring)
+		defer cancel()
 	}
-	if handlerCtx.Err() != nil || pollCtx.Err() != nil {
+	if ctx.Err() != nil {
+		if workCtx.Err() == nil {
+			logger.WarnContext(logCtx, "Kafka share 消息锁即将过期，交还 broker 重新投递",
+				"topic", topic, "group", group, "message_id", message.ID, "delivery_count", deliveryCount)
+		}
 		return kgo.AckRelease
 	}
 
-	kafkaLogger(config).WarnContext(context.WithoutCancel(handlerCtx), "处理 Kafka share 消息失败",
-		"topic", topic, "group", group, "message_id", message.ID,
-		"delivery_count", deliveryCount, "error", handlerErr)
-	if deliveryCount < int32(config.maxDeliveryAttempts) {
-		return kgo.AckRelease
+	maxAttempts := int32(config.maxDeliveryAttempts)
+	var handlerErr error
+	if deliveryCount > maxAttempts {
+		// 上一次投递已用尽处理次数但 DLQ 写入失败，本次只补写 DLQ。
+		handlerErr = errKafkaDeliveryExhausted
+	} else {
+		handlerCtx := ctx
+		if deliveryCount == maxAttempts && !lockDeadline.IsZero() {
+			var cancel context.CancelFunc
+			handlerCtx, cancel = context.WithDeadlineCause(
+				ctx, lockDeadline.Add(-kafkaShareLockMargin-kafkaShareDLQReserve), errKafkaShareLockExpiring,
+			)
+			defer cancel()
+		}
+		handlerErr = handleKafkaMessage(handlerCtx, handler, message, config.handlerTimeout)
+		if handlerErr == nil {
+			return kgo.AckAccept
+		}
+		if workCtx.Err() != nil {
+			return kgo.AckRelease
+		}
+		logger.WarnContext(logCtx, "处理 Kafka share 消息失败",
+			"topic", topic, "group", group, "message_id", message.ID,
+			"delivery_count", deliveryCount, "error", handlerErr)
+		if ctx.Err() != nil {
+			return kgo.AckRelease
+		}
+		if deliveryCount < maxAttempts {
+			// broker 释放后会立即重投，先持有一段退避时间，避免下游故障时瞬间耗尽投递次数。
+			waitKafkaRetryUntil(pollCtx, ctx,
+				kafkaRetryDelay(config.retryBackoff, config.retryMaxBackoff, int(deliveryCount)-1))
+			return kgo.AckRelease
+		}
 	}
-	if err := m.publishKafkaDLQ(handlerCtx, topic, group, record, int64(deliveryCount), handlerErr, config); err != nil {
-		kafkaLogger(config).ErrorContext(context.WithoutCancel(handlerCtx), "写入 Kafka share DLQ 失败",
+
+	if err := m.publishKafkaDLQ(ctx, topic, group, record, int64(deliveryCount), handlerErr, config); err != nil {
+		logger.ErrorContext(logCtx, "写入 Kafka share DLQ 失败",
 			"topic", topic, "group", group, "message_id", message.ID, "error", err)
 		return kgo.AckRelease
 	}
@@ -691,7 +1081,7 @@ func (m *kafkaMQ) publishKafkaDLQ(
 		Topic: topic + kafkaDLQSuffix, Key: record.Key, Value: record.Value,
 		Headers: headers, Timestamp: record.Timestamp,
 	}
-	produceCtx, cancel := context.WithTimeout(parent, config.retryMaxBackoff)
+	produceCtx, cancel := context.WithTimeout(parent, kafkaDLQProduceTimeout)
 	err := m.producer.ProduceSync(produceCtx, dlqRecord).FirstErr()
 	cancel()
 	if err != nil {
@@ -723,6 +1113,22 @@ func handleKafkaMessage(
 		return err
 	}
 	return handlerCtx.Err()
+}
+
+// logKafkaPollErrors 记录拉取中的分区错误，返回 client 是否已关闭以及是否存在需要退避的错误。
+func logKafkaPollErrors(config kafkaSubscriptionConfig, topic, group string, fetches kgo.Fetches) (closed, failed bool) {
+	fetches.EachError(func(fetchTopic string, partition int32, err error) {
+		switch {
+		case errors.Is(err, kgo.ErrClientClosed):
+			closed = true
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		default:
+			failed = true
+			kafkaLogger(config).Error("拉取 Kafka 消息失败",
+				"topic", topic, "group", group, "fetch_topic", fetchTopic, "partition", partition, "error", err)
+		}
+	})
+	return closed, failed
 }
 
 func (m *kafkaMQ) subscriptionConfig(options ...coremq.SubscribeOption) (kafkaSubscriptionConfig, error) {
@@ -772,12 +1178,48 @@ func (m *kafkaMQ) subscriptionConfig(options ...coremq.SubscribeOption) (kafkaSu
 			}
 			config.maxDeliveryAttempts = *resolved.Kafka.MaxDeliveryAttempts
 		}
+		if resolved.Kafka.ShareConsumers != nil {
+			if m.mode != kafkaShareGroup {
+				return kafkaSubscriptionConfig{}, fmt.Errorf("%w: share consumers option on traditional kafka", coremq.ErrUnsupportedSubscribeOption)
+			}
+			config.shareConsumers = *resolved.Kafka.ShareConsumers
+		}
 	}
 	if config.batchSize > kafkaMaxConsumerBatchSize || config.concurrency > kafkaMaxConcurrency || config.maxRetries > kafkaMaxRetries ||
-		config.maxDeliveryAttempts > kafkaMaxShareDeliveryAttempts {
+		config.maxDeliveryAttempts > kafkaMaxShareDeliveryAttempts || config.shareConsumers > kafkaMaxShareConsumers {
 		return kafkaSubscriptionConfig{}, fmt.Errorf("%w: kafka subscription value exceeds limit", coremq.ErrInvalidSubscribeOption)
 	}
+	if config.mode == kafkaShareGroup {
+		if config.shareConsumers > config.concurrency {
+			return kafkaSubscriptionConfig{}, fmt.Errorf("%w: kafka share consumers exceed concurrency", coremq.ErrInvalidSubscribeOption)
+		}
+		if len(kafkaShareConsumerLimits(config)) > kafkaMaxShareConsumers {
+			return kafkaSubscriptionConfig{}, fmt.Errorf("%w: kafka share batch size is too small for concurrency", coremq.ErrInvalidSubscribeOption)
+		}
+		if m.shareDeliveryLimit > 0 && config.maxDeliveryAttempts >= m.shareDeliveryLimit {
+			return kafkaSubscriptionConfig{}, fmt.Errorf("%w: kafka share delivery attempts must be less than broker %s=%d",
+				coremq.ErrInvalidSubscribeOption, kafkaShareDeliveryLimitConfig, m.shareDeliveryLimit)
+		}
+	}
 	return config, nil
+}
+
+// kafkaShareConsumerLimits 把订阅并发平均分给多个 share consumer，返回每个 consumer 单次拉取的上限。
+// 每个 consumer 至少要拿到一个槽位，单个 consumer 的上限不超过 batchSize。
+func kafkaShareConsumerLimits(config kafkaSubscriptionConfig) []int {
+	count := config.shareConsumers
+	if count == 0 {
+		count = min(config.concurrency, defaultKafkaShareConsumers)
+	}
+	count = max(count, (config.concurrency+config.batchSize-1)/config.batchSize)
+	limits := make([]int, count)
+	for index := range limits {
+		limits[index] = config.concurrency / count
+		if index < config.concurrency%count {
+			limits[index]++
+		}
+	}
+	return limits
 }
 
 func validateKafkaConfig(config MQConfig) error {
@@ -794,31 +1236,35 @@ func validateKafkaConfig(config MQConfig) error {
 		}
 	}
 	kafkaConfig := config.Kafka
-	if kafkaConfig.DialTimeout < 0 || kafkaConfig.HandlerTimeout < 0 || kafkaConfig.BatchProcessingTimeout < 0 ||
-		kafkaConfig.RebalanceTimeout < 0 || kafkaConfig.RetryBackoff < 0 || kafkaConfig.RetryMaxBackoff < 0 {
+	if kafkaConfig.DialTimeout < 0 || kafkaConfig.HandlerTimeout < 0 || kafkaConfig.RebalanceTimeout < 0 ||
+		kafkaConfig.RetryBackoff < 0 || kafkaConfig.RetryMaxBackoff < 0 {
 		return fmt.Errorf("%w: kafka duration is negative", ErrInvalidConfig)
 	}
 	if kafkaConfig.ConsumerBatchSize < 0 || kafkaConfig.ConsumerBatchSize > kafkaMaxConsumerBatchSize ||
 		kafkaConfig.Concurrency < 0 || kafkaConfig.Concurrency > kafkaMaxConcurrency ||
 		kafkaConfig.MaxRetries < 0 || kafkaConfig.MaxRetries > kafkaMaxRetries ||
-		kafkaConfig.MaxDeliveryAttempts < 0 || kafkaConfig.MaxDeliveryAttempts > kafkaMaxShareDeliveryAttempts {
+		kafkaConfig.MaxDeliveryAttempts < 0 || kafkaConfig.MaxDeliveryAttempts > kafkaMaxShareDeliveryAttempts ||
+		kafkaConfig.ShareConsumers < 0 || kafkaConfig.ShareConsumers > kafkaMaxShareConsumers {
 		return fmt.Errorf("%w: kafka numeric value is invalid", ErrInvalidConfig)
 	}
-	if config.Type == MQTypeKafka && kafkaConfig.MaxDeliveryAttempts != 0 {
-		return fmt.Errorf("%w: share delivery attempts on traditional kafka", ErrInvalidConfig)
+	if config.Type == MQTypeKafka && (kafkaConfig.MaxDeliveryAttempts != 0 || kafkaConfig.ShareConsumers != 0) {
+		return fmt.Errorf("%w: share options on traditional kafka", ErrInvalidConfig)
 	}
 	if config.Type == MQTypeKafkaShare && kafkaConfig.MaxRetries != 0 {
 		return fmt.Errorf("%w: traditional retries on kafka share", ErrInvalidConfig)
 	}
-	if config.Type == MQTypeKafkaShare && (kafkaConfig.BatchProcessingTimeout != 0 || kafkaConfig.RebalanceTimeout != 0) {
-		return fmt.Errorf("%w: traditional batch timeout on kafka share", ErrInvalidConfig)
+	if config.Type == MQTypeKafkaShare && kafkaConfig.RebalanceTimeout != 0 {
+		return fmt.Errorf("%w: rebalance timeout on kafka share", ErrInvalidConfig)
 	}
 	runtimeConfig := kafkaRuntimeConfigFrom(kafkaConfig, kafkaMode(config.Type))
 	if runtimeConfig.retryMaxBackoff < runtimeConfig.retryBackoff {
 		return fmt.Errorf("%w: kafka retry max backoff is less than retry backoff", ErrInvalidConfig)
 	}
-	if config.Type == MQTypeKafka && runtimeConfig.batchProcessingTimeout >= runtimeConfig.rebalanceTimeout {
-		return fmt.Errorf("%w: kafka batch processing timeout must be less than rebalance timeout", ErrInvalidConfig)
+	if config.Type == MQTypeKafkaShare {
+		shareConfig := kafkaSubscriptionConfig{kafkaRuntimeConfig: runtimeConfig, mode: kafkaShareGroup}
+		if runtimeConfig.shareConsumers > runtimeConfig.concurrency || len(kafkaShareConsumerLimits(shareConfig)) > kafkaMaxShareConsumers {
+			return fmt.Errorf("%w: kafka share consumers do not fit concurrency and batch size", ErrInvalidConfig)
+		}
 	}
 	if kafkaConfig.SASL == nil {
 		return nil
@@ -840,60 +1286,177 @@ func prepareKafka(ctx context.Context, name string, config MQConfig) (preparedCl
 	if err != nil {
 		return preparedClient{}, fmt.Errorf("create kafka client: %w", err)
 	}
+	mode := kafkaMode(config.Type)
+	runtimeConfig := kafkaRuntimeConfigFrom(config.Kafka, mode)
+	shareDeliveryLimit := 0
 	if !config.SkipCheck {
 		checkCtx, cancel := checkContext(ctx, config.CheckTimeout)
 		err = producer.Ping(checkCtx)
-		cancel()
 		if err != nil {
+			cancel()
 			producer.Close()
 			return preparedClient{}, fmt.Errorf("kafka connection check: %w", err)
 		}
+		if mode == kafkaShareGroup {
+			shareDeliveryLimit, err = checkKafkaShareDeliveryLimit(checkCtx, producer, runtimeConfig)
+		}
+		cancel()
+		if err != nil {
+			producer.Close()
+			return preparedClient{}, err
+		}
 	}
 
-	mode := kafkaMode(config.Type)
-	runtimeConfig := kafkaRuntimeConfigFrom(config.Kafka, mode)
-	newConsumer := func(topic, group string, subscriptionConfig kafkaSubscriptionConfig) (kafkaConsumer, error) {
+	newConsumer := func(topic, group string, subscriptionConfig kafkaSubscriptionConfig, setup kafkaConsumerSetup) (kafkaConsumer, error) {
+		logger := kafkaLogger(subscriptionConfig)
 		options := append([]kgo.Opt(nil), commonOptions...)
 		options = append(options, kgo.ConsumeTopics(topic))
 		if mode == kafkaShareGroup {
-			limit := kafkaShareFetchLimit(subscriptionConfig)
 			options = append(options,
 				kgo.ShareGroup(group),
-				kgo.ShareMaxRecords(int32(limit)),
+				kgo.ShareMaxRecords(int32(setup.shareFetchLimit)),
 				kgo.ShareMaxRecordsStrict(),
+				// 不预取：预取到本地等待处理的消息同样在消耗 broker 的获取锁时间。
 				kgo.MaxConcurrentFetches(0),
 				kgo.ShareAckCallback(func(_ *kgo.Client, results kgo.ShareAckResults) {
 					if err := results.Error(); err != nil {
-						kafkaLogger(subscriptionConfig).Error("确认 Kafka share 消息失败", "group", group, "error", err)
+						logger.Error("确认 Kafka share 消息失败", "topic", topic, "group", group, "error", err)
 					}
 				}),
 			)
-		} else {
-			if subscriptionConfig.startOffset != nil {
-				offset := kafkaOffset(*subscriptionConfig.startOffset)
-				options = append(options, kgo.ConsumeStartOffset(offset), kgo.ConsumeResetOffset(offset))
-			}
-			options = append(options,
-				kgo.ConsumerGroup(group),
-				kgo.DisableAutoCommit(),
-				kgo.BlockRebalanceOnPoll(),
-				kgo.RebalanceTimeout(subscriptionConfig.rebalanceTimeout),
-				kgo.OnPartitionsCallbackBlocked(func(context.Context, *kgo.Client) {
-					if subscriptionConfig.batchController != nil {
-						subscriptionConfig.batchController.interrupt(errKafkaRebalanceBlocked)
-					}
-				}),
-			)
+			return kgo.NewClient(options...)
 		}
+
+		if subscriptionConfig.startOffset != nil {
+			offset := kafkaOffset(*subscriptionConfig.startOffset)
+			options = append(options, kgo.ConsumeStartOffset(offset), kgo.ConsumeResetOffset(offset))
+		}
+		hooks := setup.hooks
+		options = append(options,
+			kgo.ConsumerGroup(group),
+			// 恢复暂停的分区要等在途的长轮询返回，与 Java 客户端默认值对齐以缩短这段空等。
+			kgo.FetchMaxWait(kafkaConsumerFetchMaxWait),
+			kgo.AutoCommitMarks(),
+			kgo.AutoCommitCallback(func(_ *kgo.Client, _ *kmsg.OffsetCommitRequest, response *kmsg.OffsetCommitResponse, err error) {
+				if err == nil {
+					err = kafkaOffsetCommitError(response)
+				}
+				if err != nil {
+					logger.Error("自动提交 Kafka offset 失败", "topic", topic, "group", group, "error", err)
+				}
+			}),
+			kgo.BlockRebalanceOnPoll(),
+			kgo.RebalanceTimeout(subscriptionConfig.rebalanceTimeout),
+			kgo.OnPartitionsAssigned(func(_ context.Context, _ *kgo.Client, partitions map[string][]int32) {
+				hooks.assigned(partitions)
+			}),
+			kgo.OnPartitionsRevoked(func(_ context.Context, _ *kgo.Client, partitions map[string][]int32) {
+				hooks.revoked(partitions)
+			}),
+			kgo.OnPartitionsLost(func(_ context.Context, _ *kgo.Client, partitions map[string][]int32) {
+				hooks.lost(partitions)
+			}),
+		)
 		return kgo.NewClient(options...)
 	}
 
 	mq := newKafkaMQ(producer, newConsumer, mode, runtimeConfig)
+	mq.shareDeliveryLimit = shareDeliveryLimit
+	mq.topicExists = func(ctx context.Context, topic string) (bool, error) {
+		return kafkaTopicExists(ctx, producer, topic)
+	}
 	return preparedClient{
 		name: name, module: "mq", typ: string(config.Type),
 		commit: func() error { return resource.Set[coremq.MQ](name, mq) },
-		close:  func(context.Context) error { return mq.Close() },
+		close:  mq.closeContext,
 	}, nil
+}
+
+// checkKafkaShareDeliveryLimit 校验 broker 的 share 投递上限。上限不大于应用的最大投递次数时，
+// 消息会在写入 DLQ 之前被 broker 直接归档丢弃。读取失败只记录警告，不阻断启动。
+func checkKafkaShareDeliveryLimit(ctx context.Context, client *kgo.Client, config kafkaRuntimeConfig) (int, error) {
+	limit, err := kafkaShareDeliveryLimit(ctx, client)
+	if err != nil {
+		config.logger.WarnContext(ctx, "读取 Kafka broker share 投递上限失败，按默认值 5 处理",
+			"config", kafkaShareDeliveryLimitConfig, "error", err)
+		return 0, nil
+	}
+	if limit > 0 && config.maxDeliveryAttempts >= limit {
+		return 0, fmt.Errorf("%w: kafka max delivery attempts %d must be less than broker %s=%d",
+			ErrInvalidConfig, config.maxDeliveryAttempts, kafkaShareDeliveryLimitConfig, limit)
+	}
+	return limit, nil
+}
+
+func kafkaShareDeliveryLimit(ctx context.Context, client *kgo.Client) (int, error) {
+	metadata := kmsg.NewPtrMetadataRequest()
+	metadata.Topics = []kmsg.MetadataRequestTopic{}
+	metadataResponse, err := metadata.RequestWith(ctx, client)
+	if err != nil {
+		return 0, err
+	}
+	if len(metadataResponse.Brokers) == 0 {
+		return 0, errors.New("kafka metadata has no broker")
+	}
+
+	describe := kmsg.NewPtrDescribeConfigsRequest()
+	brokerResource := kmsg.NewDescribeConfigsRequestResource()
+	brokerResource.ResourceType = kmsg.ConfigResourceTypeBroker
+	brokerResource.ResourceName = strconv.Itoa(int(metadataResponse.Brokers[0].NodeID))
+	brokerResource.ConfigNames = []string{kafkaShareDeliveryLimitConfig}
+	describe.Resources = append(describe.Resources, brokerResource)
+	describeResponse, err := describe.RequestWith(ctx, client)
+	if err != nil {
+		return 0, err
+	}
+	for _, described := range describeResponse.Resources {
+		if err := kerr.ErrorForCode(described.ErrorCode); err != nil {
+			return 0, err
+		}
+		for _, entry := range described.Configs {
+			if entry.Name != kafkaShareDeliveryLimitConfig || entry.Value == nil {
+				continue
+			}
+			return strconv.Atoi(*entry.Value)
+		}
+	}
+	return 0, nil
+}
+
+func kafkaTopicExists(ctx context.Context, client *kgo.Client, topic string) (bool, error) {
+	request := kmsg.NewPtrMetadataRequest()
+	requestTopic := kmsg.NewMetadataRequestTopic()
+	requestTopic.Topic = kmsg.StringPtr(topic)
+	request.Topics = append(request.Topics, requestTopic)
+	response, err := request.RequestWith(ctx, client)
+	if err != nil {
+		return false, err
+	}
+	for _, responseTopic := range response.Topics {
+		if responseTopic.Topic == nil || *responseTopic.Topic != topic {
+			continue
+		}
+		err := kerr.ErrorForCode(responseTopic.ErrorCode)
+		if errors.Is(err, kerr.UnknownTopicOrPartition) {
+			return false, nil
+		}
+		return err == nil, err
+	}
+	return false, nil
+}
+
+func kafkaOffsetCommitError(response *kmsg.OffsetCommitResponse) error {
+	if response == nil {
+		return nil
+	}
+	for _, topic := range response.Topics {
+		for _, partition := range topic.Partitions {
+			if err := kerr.ErrorForCode(partition.ErrorCode); err != nil {
+				return fmt.Errorf("topic %s partition %d: %w", topic.Topic, partition.Partition, err)
+			}
+		}
+	}
+	return nil
 }
 
 func kafkaOffset(start coremq.KafkaStartOffset) kgo.Offset {
@@ -907,9 +1470,9 @@ func kafkaRuntimeConfigFrom(config *KafkaConfig, mode kafkaGroupMode) kafkaRunti
 	runtimeConfig := kafkaRuntimeConfig{
 		batchSize: config.ConsumerBatchSize, concurrency: config.Concurrency,
 		handlerTimeout: config.HandlerTimeout, maxRetries: config.MaxRetries,
-		maxDeliveryAttempts:    config.MaxDeliveryAttempts,
-		batchProcessingTimeout: config.BatchProcessingTimeout, rebalanceTimeout: config.RebalanceTimeout,
-		retryBackoff: config.RetryBackoff, retryMaxBackoff: config.RetryMaxBackoff,
+		maxDeliveryAttempts: config.MaxDeliveryAttempts, shareConsumers: config.ShareConsumers,
+		rebalanceTimeout: config.RebalanceTimeout,
+		retryBackoff:     config.RetryBackoff, retryMaxBackoff: config.RetryMaxBackoff,
 		logger: config.Logger,
 	}
 	if runtimeConfig.batchSize == 0 {
@@ -928,13 +1491,8 @@ func kafkaRuntimeConfigFrom(config *KafkaConfig, mode kafkaGroupMode) kafkaRunti
 	if mode == kafkaShareGroup && runtimeConfig.maxDeliveryAttempts == 0 {
 		runtimeConfig.maxDeliveryAttempts = defaultKafkaShareDeliveryAttempts
 	}
-	if mode == kafkaConsumerGroup {
-		if runtimeConfig.batchProcessingTimeout == 0 {
-			runtimeConfig.batchProcessingTimeout = defaultKafkaBatchProcessingTimeout
-		}
-		if runtimeConfig.rebalanceTimeout == 0 {
-			runtimeConfig.rebalanceTimeout = defaultKafkaRebalanceTimeout
-		}
+	if mode == kafkaConsumerGroup && runtimeConfig.rebalanceTimeout == 0 {
+		runtimeConfig.rebalanceTimeout = defaultKafkaRebalanceTimeout
 	}
 	if runtimeConfig.retryBackoff == 0 {
 		runtimeConfig.retryBackoff = defaultKafkaRetryBackoff
@@ -1016,13 +1574,9 @@ func kafkaMode(typ MQType) kafkaGroupMode {
 	return kafkaConsumerGroup
 }
 
-func kafkaShareFetchLimit(config kafkaSubscriptionConfig) int {
-	return min(config.batchSize, config.concurrency)
-}
-
-func closeKafkaConsumer(consumer kafkaConsumer, mode kafkaGroupMode, timeout time.Duration) error {
+func closeKafkaConsumer(consumer kafkaConsumer, mode kafkaGroupMode) error {
 	if mode == kafkaShareGroup {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(context.Background(), kafkaFlushAcksTimeout)
 		err := consumer.FlushAcks(ctx)
 		cancel()
 		consumer.Close()
@@ -1061,11 +1615,6 @@ func waitKafkaRetryUntil(pollCtx, workCtx context.Context, delay time.Duration) 
 	case <-timer.C:
 		return true
 	}
-}
-
-func kafkaConsumerGroupCommitTimeout(config kafkaSubscriptionConfig) time.Duration {
-	// 批次截止后只使用预留的 rebalance 窗口提交连续成功前缀。
-	return min(config.retryMaxBackoff, config.rebalanceTimeout-config.batchProcessingTimeout)
 }
 
 func kafkaRetryDelay(base, maximum time.Duration, attempt int) time.Duration {

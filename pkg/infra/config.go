@@ -120,9 +120,13 @@ type ElasticsearchConfig struct {
 }
 
 // KafkaConfig 配置 Kafka broker、认证、消费并发和失败重试策略。
-// MaxRetries 仅用于传统 consumer group，表示首次失败后的额外原地重试次数。
-// MaxDeliveryAttempts 仅用于 share group，包含首次投递；零值默认为 4，上限为 4。
-// 部署时 broker 的 group.share.delivery.count.limit 应配置为 5。
+// 每个订阅 topic 都需要预先创建 "<topic>.dlq"，缺失时 Subscribe 返回错误。
+//
+// 传统 consumer group 为每个分区维护一个串行 worker，分区内有序、分区间并行，
+// 某个分区的慢消息或 DLQ 故障只阻塞该分区。MaxRetries 仅用于传统组，表示首次失败后的额外原地重试次数。
+//
+// share group 不保证顺序。MaxDeliveryAttempts 仅用于 share group，包含首次投递；零值默认为 4，上限为 4，
+// 且必须小于 broker 的 group.share.delivery.count.limit（默认 5），启动检查时会校验。
 type KafkaConfig struct {
 	Brokers     []string      `json:"brokers,omitempty" yaml:"brokers,omitempty"`
 	ClientID    string        `json:"client_id,omitempty" yaml:"client_id,omitempty"`
@@ -133,15 +137,18 @@ type KafkaConfig struct {
 	// ConsumerBatchSize 和 Concurrency 的零值分别默认为 100 和 10。
 	ConsumerBatchSize int `json:"consumer_batch_size,omitempty" yaml:"consumer_batch_size,omitempty"`
 	Concurrency       int `json:"concurrency,omitempty" yaml:"concurrency,omitempty"`
-	// HandlerTimeout 的零值在传统组中为 30 秒，在 share group 中为 15 秒；
-	// share group 中应小于 broker 的 share.record.lock.duration.ms。
+	// HandlerTimeout 的零值在传统组中为 30 秒，在 share group 中为 15 秒。
+	// share group 中实际截止时间还会被 broker 的获取锁期限（share.record.lock.duration.ms，默认 30 秒）截断。
 	HandlerTimeout      time.Duration `json:"handler_timeout,omitempty" yaml:"handler_timeout,omitempty"`
 	MaxRetries          int           `json:"max_retries,omitempty" yaml:"max_retries,omitempty"`
 	MaxDeliveryAttempts int           `json:"max_delivery_attempts,omitempty" yaml:"max_delivery_attempts,omitempty"`
-	// BatchProcessingTimeout 和 RebalanceTimeout 仅用于传统组，零值分别默认为 45 秒和 60 秒。
-	// 前者限制一批消息从 Handler 到 DLQ 的总处理时间，必须小于后者。
-	BatchProcessingTimeout time.Duration `json:"batch_processing_timeout,omitempty" yaml:"batch_processing_timeout,omitempty"`
-	RebalanceTimeout       time.Duration `json:"rebalance_timeout,omitempty" yaml:"rebalance_timeout,omitempty"`
+	// ShareConsumers 仅用于 share group，表示每个订阅并行运行的 share consumer 数量，Concurrency 平均分给它们。
+	// 单个 consumer 必须等本批消息全部确认后才能再次拉取，多个 consumer 可避免一条慢消息拖住整个订阅。
+	// 零值默认为 min(Concurrency, 4)，上限为 64；不能超过 Concurrency。
+	ShareConsumers int `json:"share_consumers,omitempty" yaml:"share_consumers,omitempty"`
+	// RebalanceTimeout 仅用于传统组，零值默认为 60 秒。分区被回收时先等待进行中的消息最多一半时长，
+	// 再取消 Handler，并在剩余时间内提交已完成的位置；HandlerTimeout 建议不超过它的一半。
+	RebalanceTimeout time.Duration `json:"rebalance_timeout,omitempty" yaml:"rebalance_timeout,omitempty"`
 	// RetryBackoff 和 RetryMaxBackoff 的零值分别默认为 1 秒和 30 秒。
 	RetryBackoff    time.Duration `json:"retry_backoff,omitempty" yaml:"retry_backoff,omitempty"`
 	RetryMaxBackoff time.Duration `json:"retry_max_backoff,omitempty" yaml:"retry_max_backoff,omitempty"`

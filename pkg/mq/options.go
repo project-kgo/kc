@@ -42,6 +42,7 @@ type RedisStreamSubscribeOptions struct {
 type KafkaSubscribeOptions struct {
 	MaxRetries          *int
 	MaxDeliveryAttempts *int
+	ShareConsumers      *int
 	StartOffset         *KafkaStartOffset
 }
 
@@ -150,6 +151,17 @@ func WithKafkaShareMaxDeliveryAttempts(attempts int) SubscribeOption {
 			return fmt.Errorf("%w: kafka share max delivery attempts must be positive", ErrInvalidSubscribeOption)
 		}
 		kafkaOptions(options).MaxDeliveryAttempts = intPointer(attempts)
+		return nil
+	})
+}
+
+// WithKafkaShareConsumers 覆盖 share group 订阅并行运行的 share consumer 数量，不能超过订阅并发。
+func WithKafkaShareConsumers(consumers int) SubscribeOption {
+	return subscribeOptionFunc(func(options *SubscribeOptions) error {
+		if consumers <= 0 {
+			return fmt.Errorf("%w: kafka share consumers must be positive", ErrInvalidSubscribeOption)
+		}
+		kafkaOptions(options).ShareConsumers = intPointer(consumers)
 		return nil
 	})
 }
