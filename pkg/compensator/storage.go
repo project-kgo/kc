@@ -58,8 +58,9 @@ func (s *pgStorage) setNames(schema string) {
 	s.tasks = quoteIdent(schema) + "." + quoteIdent(s.taskName)
 	// 以 text[] 传参再在 SQL 中转换，避免依赖驱动对 uuid 数组的二进制编码。
 	s.insertSQL = `INSERT INTO ` + s.tasks + ` (id, task_type, payload, status, attempts, next_run_at, created_at, updated_at)
-SELECT u.id::uuid, u.task_type, u.payload, 0, 0, now(), now(), now()
-FROM unnest($1::text[], $2::text[], $3::text[]) AS u(id, task_type, payload)`
+SELECT u.id::uuid, u.task_type, u.payload, 0, 0,
+  CASE WHEN u.run_at = '' THEN now() ELSE u.run_at::timestamptz END, now(), now()
+FROM unnest($1::text[], $2::text[], $3::text[], $4::text[]) AS u(id, task_type, payload, run_at)`
 	// 领取：走 due_idx 取最早到期的任务，SKIP LOCKED 使各节点并发领取互不阻塞。
 	// 只领取本节点注册了回调的类型，滚动发布新增类型时旧节点不会领取后因缺少回调而失败。
 	// 写入新令牌和租约到期时间后语句即提交，回调在事务外执行。
@@ -86,13 +87,18 @@ RETURNING t.id, t.task_type, t.payload, t.attempts, t.status`
 WHERE id = $1::text::uuid AND status = 1 AND lease_token = $2`
 }
 
-// insert 在业务事务内写入立即可领取的待执行任务。
+// insert 在业务事务内写入待执行任务。RunAt 为零时以数据库时钟取 now()，
+// 表示提交后立即可领取；否则写入指定时间，到期前领取语句不会选中该行。
 func (s *pgStorage) insert(ctx context.Context, tx *sqlx.Tx, tasks []Task) error {
-	ids, types, payloads := make([]string, len(tasks)), make([]string, len(tasks)), make([]string, len(tasks))
+	ids, types, payloads, runAts := make([]string, len(tasks)), make([]string, len(tasks)), make([]string, len(tasks)), make([]string, len(tasks))
 	for i, t := range tasks {
 		ids[i], types[i], payloads[i] = t.ID.String(), t.Type, t.Payload
+		if !t.RunAt.IsZero() {
+			// 统一转成 UTC 的 RFC3339Nano 文本，由 SQL 转换为 timestamptz。
+			runAts[i] = t.RunAt.UTC().Format(time.RFC3339Nano)
+		}
 	}
-	_, err := tx.ExecContext(ctx, s.insertSQL, ids, types, payloads)
+	_, err := tx.ExecContext(ctx, s.insertSQL, ids, types, payloads, runAts)
 	return err
 }
 

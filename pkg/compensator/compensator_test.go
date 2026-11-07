@@ -145,7 +145,8 @@ func (f *fakeStorage) insert(_ context.Context, _ *sqlx.Tx, tasks []Task) error 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, t := range tasks {
-		f.tasks[t.ID] = &fakeRow{task: t, status: StatusPending}
+		// 与 SQL 语义一致：RunAt 决定首次可领取时间，零值表示立即。
+		f.tasks[t.ID] = &fakeRow{task: t, status: StatusPending, due: t.RunAt}
 	}
 	return nil
 }
@@ -415,6 +416,60 @@ func TestRunnableReportsExhausted(t *testing.T) {
 	}
 	if metrics.count(StatusFailed) != 1 {
 		t.Fatal("exhausted task must be reported")
+	}
+}
+
+// 指定 RunAt 的任务在到期前不会被领取，到点后由扫描正常执行。
+func TestScheduledTaskWaitsForDueTime(t *testing.T) {
+	store := newFakeStorage()
+	id := uuid.Must(uuid.NewV7())
+	if err := store.insert(context.Background(), nil, []Task{{ID: id, Type: "t", RunAt: time.Now().Add(time.Hour)}}); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int64
+	cfg := testConfig(t, Config{WorkerCount: 1, ScanInterval: 5 * time.Millisecond})
+	c, err := start(context.Background(), nil, store, cfg, mustRegistry(map[string]Handler{
+		"t": func(context.Context, *Task) error { calls.Add(1); return nil },
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond) // 扫描多轮，任务仍未到期
+	if calls.Load() != 0 {
+		t.Fatalf("task ran %d times before its due time", calls.Load())
+	}
+	if r, getErr := store.get(context.Background(), id); getErr != nil || r.Attempts != 0 || r.Status != StatusPending {
+		t.Fatalf("scheduled task should stay untouched: %+v %v", r, getErr)
+	}
+	// 模拟时间到达：把到期时间推到过去，下一次扫描即可领取。
+	store.mu.Lock()
+	store.tasks[id].due = time.Now().Add(-time.Second)
+	store.mu.Unlock()
+	c.notify()
+	waitFor(t, 5*time.Second, func() bool { return calls.Load() == 1 })
+	if err = c.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// 计划时间必须能被 RFC3339 表示；非法时间在登记阶段就被拒绝，不留给数据库报错。
+func TestPrepareValidatesRunAt(t *testing.T) {
+	c := &Compensator{}
+	c.handlers.Store(mustRegistry(map[string]Handler{"t": func(context.Context, *Task) error { return nil }}))
+	for _, runAt := range []time.Time{
+		time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC),
+		// 本地年份合法但换算成 UTC 后落到公元 0 年，同样无法表示为 RFC3339。
+		time.Date(1, 1, 1, 0, 0, 0, 0, time.FixedZone("", 14*3600)),
+	} {
+		if _, err := c.prepare(Task{Type: "t", RunAt: runAt}); !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("run at %v: %v", runAt, err)
+		}
+	}
+	last := time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC).Add(-time.Nanosecond)
+	task, err := c.prepare(Task{Type: "t", RunAt: last})
+	if err != nil || !task.RunAt.Equal(last) {
+		t.Fatalf("valid schedule rejected or altered: %+v %v", task, err)
 	}
 }
 

@@ -1,7 +1,7 @@
 // Package compensator 提供基于 PostgreSQL 的本地任务补偿组件。
 //
-// 业务在自己的事务中登记任务，提交后由所有节点的后台 worker 共同领取执行；
-// 失败或进程崩溃时按退避策略重试，直至成功或耗尽重试次数。
+// 业务在自己的事务中登记任务，可按指定时间延迟执行；提交后由所有节点的后台 worker
+// 共同领取执行，失败或进程崩溃时按退避策略重试，直至成功或耗尽重试次数。
 package compensator
 
 import (
@@ -62,6 +62,10 @@ type Task struct {
 	Payload string
 	// Attempt 是当前第几次执行，首次为 1。
 	Attempt int
+	// RunAt 指定任务的下次执行时间，只影响首次执行：零值或已过去的时间表示提交后立即可执行，
+	// 失败重试仍按退避策略重新排期。到期由数据库时钟判断，调用方时钟偏差会直接影响触发时刻。
+	// 回调收到的 Task 中该字段为零值；Get 返回的 Record.NextRunAt 才是库中的实际时间。
+	RunAt time.Time
 }
 
 // NewTask 使用 sonic 将 value 编码为 Payload 字符串。

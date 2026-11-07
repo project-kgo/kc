@@ -44,6 +44,29 @@ if err != nil {
 
 `Payload` 是 sonic 编码的 JSON 字符串：`NewTask` 用 `sonic.MarshalString` 编码，`Task.Decode` 用 `sonic.UnmarshalString` 解码。已编码的字符串可直接赋值 `Task{Type: "...", Payload: s}`。库中以 `TEXT` 原样保存，不做 JSON 校验或规范化。
 
+### 指定执行时间
+
+登记时用 `Task.RunAt` 指定首次执行时间。零值表示提交后立即可执行，过去的时间同样按立即可执行处理：
+
+```go
+task, err := compensator.NewTask("order.remind", OrderPaid{OrderID: 42})
+if err != nil {
+    return err
+}
+task.RunAt = time.Now().Add(24 * time.Hour)
+
+err = comp.Transaction(ctx, func(tx *compensator.Tx) error {
+    _, err := tx.Add(ctx, task)
+    return err
+})
+```
+
+- 只影响首次执行；失败后的重试仍按 `RetryBackoffMin` / `RetryBackoffMax` 退避，`Retry` 也仍然立即重新排期。
+- 是否到期由数据库时钟判断（`next_run_at <= now()`），但 `RunAt` 是调用方给出的绝对时间：用本机 `time.Now()` 计算时，节点时钟偏差会直接反映到实际触发时刻。
+- 实际触发时间不会早于 `RunAt`，延迟最多一个 `ScanInterval` 加一次领取往返，不保证毫秒级准时。到期后由任一节点领取，与普通任务没有区别。
+- 远期任务会一直保留在待执行索引（`status < 2`）中；领取仍按 `next_run_at` 顺序只取到期行，不影响领取效率，只占用少量索引空间。
+- 回调收到的 `Task` 中 `RunAt` 为零值；`Get` 返回的 `Record.NextRunAt` 才是库中的实际时间。
+
 ### 单独注册回调
 
 `New` 的 `handlers` 可以为空，回调也可以在组件运行期间注册，适合各业务模块各自注册回调的场景：
@@ -62,7 +85,7 @@ err = comp.RegisterAll(map[string]compensator.Handler{"order.refund": handleRefu
 
 ## 执行流程
 
-1. **登记**：`Transaction` / `AddTx` 在业务事务内把任务写为 `pending`，随业务一起提交或回滚。回调不会在事务内执行。
+1. **登记**：`Transaction` / `AddTx` 在业务事务内把任务写为 `pending`，随业务一起提交或回滚。设置 `Task.RunAt` 可指定首次可领取时间，零值或过去时间表示提交后立即可领取。回调不会在事务内执行。
 2. **领取**：各节点的扫描循环用一条短语句领取到期任务：`FOR UPDATE SKIP LOCKED` 选出最早到期的行，改为 `running`，写入随机令牌，并把 `next_run_at` 设为租约到期时间（`LeaseDuration`）。语句提交后行锁即释放，回调在事务外执行。只领取空闲 worker 数量、且本节点注册了回调的类型的任务，领取后立即开始执行，不在本地排队。
 3. **落库**：回调结束后按令牌写回结果：成功为 `succeeded`；失败且有剩余次数为 `pending` 并按退避推迟 `next_run_at`；次数耗尽为 `failed`。令牌不匹配（租约已被接管）时旧结果不会覆盖新状态。
 
@@ -145,7 +168,7 @@ type Metrics interface {
 | 滚动发布新增任务类型 | 节点只领取自己注册了回调的类型，旧节点不会领取新类型后因缺少回调而失败 |
 | 回调成功后、结果落库前崩溃 | 无法避免，任务会再次执行 |
 
-所有时间判断使用数据库时钟，节点时钟漂移不影响租约。
+所有时间判断使用数据库时钟，节点时钟漂移不影响租约；登记时指定的 `RunAt` 是调用方给出的绝对时间，见[指定执行时间](#指定执行时间)。
 
 组件提供**至少一次**执行，不保证顺序：回调必须幂等，建议以 `task.ID` 作为下游幂等键。
 
@@ -201,6 +224,6 @@ TEST_POSTGRES_DSN='postgres://user:pass@127.0.0.1:5432/test?sslmode=disable' \
 TEST_POSTGRES_DSN='...' go test ./pkg/compensator -run '^$' -bench PostgreSQL -benchmem
 ```
 
-设置 `TEST_COMPENSATOR_LOG=1` 可输出集成测试中组件的日志。集成测试覆盖：并发建表与表参数、结构不兼容时拒绝启动、回调能看到已提交的业务数据、业务回滚、外部事务、慢回调下不因本地排队丢失租约、只领取已注册的类型、崩溃后租约接管、旧令牌无法覆盖、重试耗尽与 `Retry`、多节点并发清理、清理跳过重试中的任务、三节点并发消费与节点下线（每个任务恰好成功一次）、索引使用以及删除后空间复用。
+设置 `TEST_COMPENSATOR_LOG=1` 可输出集成测试中组件的日志。集成测试覆盖：并发建表与表参数、结构不兼容时拒绝启动、回调能看到已提交的业务数据、业务回滚、外部事务、指定执行时间（到期前不领取、过去时间立即执行）、慢回调下不因本地排队丢失租约、只领取已注册的类型、崩溃后租约接管、旧令牌无法覆盖、重试耗尽与 `Retry`、多节点并发清理、清理跳过重试中的任务、三节点并发消费与节点下线（每个任务恰好成功一次）、索引使用以及删除后空间复用。
 
 `BenchmarkPostgreSQLEndToEnd` 报告从登记到回调完成的 p50/p99 延迟、调用方 `Transaction` 耗时和吞吐，建议 `-benchtime=2000x`；`BenchmarkPostgreSQLBackground` 建议 `-benchtime=1x`。

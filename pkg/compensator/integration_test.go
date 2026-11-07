@@ -287,6 +287,57 @@ func TestPostgreSQLIntegrationTransaction(t *testing.T) {
 	executions.assertOnce(t, []uuid.UUID{bizTaskID, flakyID, externalID})
 }
 
+// 登记时指定 RunAt：到期前任何节点都不会领取，到期后正常执行；过去时间按立即执行处理。
+func TestPostgreSQLIntegrationScheduled(t *testing.T) {
+	db := openTestDB(t)
+	suffix := uniqueSuffix(t, db)
+	ctx := context.Background()
+	var executions executionCounter
+	c := mustNew(t, db, fastConfig(suffix), map[string]Handler{
+		"t": func(_ context.Context, task *Task) error { executions.inc(task.ID); return nil },
+	})
+	// 以数据库时钟为基准，避免测试进程与数据库的时钟偏差影响断言。
+	var dbNow time.Time
+	if err := db.GetContext(ctx, &dbNow, "SELECT now()"); err != nil {
+		t.Fatal(err)
+	}
+	scheduled := dbNow.Add(10 * time.Second)
+	futureTask, _ := NewTask("t", 1)
+	futureTask.RunAt = scheduled
+	futureID := addTasks(t, c, futureTask, 1)[0]
+
+	record, err := c.Get(ctx, futureID)
+	if err != nil || record.Status != StatusPending || record.Attempts != 0 {
+		t.Fatalf("scheduled record: %+v %v", record, err)
+	}
+	if diff := record.NextRunAt.Sub(scheduled); diff < -time.Second || diff > time.Second {
+		t.Fatalf("next run at %v, want %v", record.NextRunAt, scheduled)
+	}
+	// 扫描已运行多轮，任务仍未被领取，也没有消耗执行次数。
+	time.Sleep(300 * time.Millisecond)
+	if record, err = c.Get(ctx, futureID); err != nil || record.Status != StatusPending || record.Attempts != 0 {
+		t.Fatalf("task claimed before its due time: %+v %v", record, err)
+	}
+	// 把计划时间推进到现在，验证到期后由正常领取路径执行。
+	db.MustExec(fmt.Sprintf("UPDATE compensator_%s SET next_run_at = now() WHERE id = $1", suffix), futureID)
+	c.notify()
+	eventually(t, func() bool { return statusOf(t, c, futureID) == StatusSucceeded })
+
+	// 过去的时间按立即可执行处理；外部事务路径同样生效。
+	pastTask, _ := NewTask("t", 2)
+	pastTask.RunAt = dbNow.Add(-time.Hour)
+	tx := db.MustBeginTx(ctx, nil)
+	pastID, err := c.AddTx(ctx, tx, pastTask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, func() bool { return statusOf(t, c, pastID) == StatusSucceeded })
+	executions.assertOnce(t, []uuid.UUID{futureID, pastID})
+}
+
 // 回调总耗时远超租约时，每个任务仍只执行一次：worker 只按空闲容量领取，
 // 领取后立即执行，任务不会在本地排队到租约过期。
 func TestPostgreSQLIntegrationSlowHandlersKeepLease(t *testing.T) {

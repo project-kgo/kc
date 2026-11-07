@@ -193,6 +193,11 @@ func (c *Compensator) prepare(task Task) (Task, error) {
 	if task.Attempt != 0 {
 		return Task{}, fmt.Errorf("%w: new task must not set attempt", ErrInvalidArgument)
 	}
+	// timestamptz 能表示更宽的范围，但 RFC3339 只覆盖公元 1..9999 年；
+	// 按 UTC 判断并在这里拒绝，避免非法时间拖到 INSERT 时才以数据库错误让整个业务事务回滚。
+	if runAt := task.RunAt.UTC(); !task.RunAt.IsZero() && (runAt.Year() < 1 || runAt.Year() > 9999) {
+		return Task{}, fmt.Errorf("%w: run at must be between years 1 and 9999", ErrInvalidArgument)
+	}
 	if task.ID == uuid.Nil {
 		id, err := uuid.NewV7()
 		if err != nil {
@@ -218,6 +223,7 @@ type Tx struct {
 func (t *Tx) SQLTx() *sqlx.Tx { return t.tx }
 
 // Add 登记任务并返回任务 ID，任务在业务回调返回后随事务一起写入。
+// 设置 Task.RunAt 可指定首次执行时间，零值表示提交后立即可执行。
 // 返回错误时整个事务不会提交，即使业务忽略了该错误。
 func (t *Tx) Add(ctx context.Context, task Task) (uuid.UUID, error) {
 	t.mu.Lock()
@@ -262,6 +268,7 @@ func (t *Tx) close() ([]Task, error) {
 
 // Transaction 在一个事务中执行业务回调，并在同一事务内写入登记的任务。提交后唤醒本节点
 // 扫描：有空闲 worker 时任务立即被领取执行，否则由任一节点在 ScanInterval 内领取。
+// 登记的任务可设置 Task.RunAt 指定首次执行时间，未到期前不会被领取。
 //
 // 返回的 error 表示业务失败、登记失败或提交失败，此时没有任何任务生效。
 func (c *Compensator) Transaction(ctx context.Context, fn func(tx *Tx) error) error {
@@ -303,7 +310,8 @@ func (c *Compensator) Transaction(ctx context.Context, fn func(tx *Tx) error) er
 }
 
 // AddTx 把任务写入调用方已有的事务并返回任务 ID。提交后任务由任一节点在 ScanInterval
-// 内领取执行。tx 必须属于创建组件时使用的同一数据库。
+// 内领取执行；设置 Task.RunAt 可指定首次执行时间，零值表示提交后立即可执行。
+// tx 必须属于创建组件时使用的同一数据库。
 func (c *Compensator) AddTx(ctx context.Context, tx *sqlx.Tx, task Task) (uuid.UUID, error) {
 	done, err := c.begin(ctx)
 	if err != nil {
