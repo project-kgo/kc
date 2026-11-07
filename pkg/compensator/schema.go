@@ -9,6 +9,8 @@ import (
 
 // 新建任务表时采用的存储参数：按绝对死元组数触发 autovacuum 并降低节流，
 // 使 DELETE 产生的死元组被及时回收，堆页和索引页的空闲空间被后续 INSERT 复用。
+// 这些阈值假设未完成任务数有限；如果用 RunAt 长期保留大量远期任务，
+// 运维应改成“绝对阈值 + 比例”的混合触发（见 README 的参数评估）。
 // 已存在的表不会被覆盖，运维可通过 ALTER TABLE 按实际吞吐调整。
 const taskTableOptions = `fillfactor = 90,
   autovacuum_vacuum_scale_factor = 0,
@@ -22,9 +24,9 @@ const taskTableOptions = `fillfactor = 90,
 
 var taskColumns = map[string]string{
 	"id": "uuid", "task_type": "text", "payload": "text", "status": "smallint",
-	"attempts": "integer", "next_run_at": "timestamp with time zone", "lease_token": "bigint",
-	"last_error": "text", "created_at": "timestamp with time zone", "updated_at": "timestamp with time zone",
-	"completed_at": "timestamp with time zone",
+	"attempts": "integer", "next_run_at": "timestamp with time zone", "first_run_at": "timestamp with time zone",
+	"lease_token": "bigint", "last_error": "text", "created_at": "timestamp with time zone",
+	"updated_at": "timestamp with time zone", "completed_at": "timestamp with time zone",
 }
 
 func quoteIdent(name string) string { return `"` + strings.ReplaceAll(name, `"`, `""`) + `"` }
@@ -59,6 +61,7 @@ func (s *pgStorage) ensureSchema(ctx context.Context) error {
   status smallint NOT NULL,
   attempts integer NOT NULL,
   next_run_at timestamptz NOT NULL,
+  first_run_at timestamptz,
   lease_token bigint NOT NULL DEFAULT 0,
   last_error text NOT NULL DEFAULT '',
   created_at timestamptz NOT NULL,

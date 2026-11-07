@@ -96,7 +96,11 @@ func (c *Compensator) runnable(tasks []claimed) []claimed {
 			result = append(result, t)
 			continue
 		}
-		err := errors.New("retry budget exhausted after lease expiration")
+		reason := t.reason
+		if reason == "" {
+			reason = "retry budget exhausted after lease expiration"
+		}
+		err := errors.New(reason)
 		c.config.Metrics.Executed(ExecEvent{Type: t.Type, Attempt: t.Attempt, Status: StatusFailed, Err: err})
 		c.config.Logger.Warn("compensator task failed", "task_id", t.ID, "type", t.Type, "attempt", t.Attempt, "error", err)
 	}

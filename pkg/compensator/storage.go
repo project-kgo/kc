@@ -19,6 +19,8 @@ type claimed struct {
 	token int64
 	// exhausted 表示该任务在领取时因预算耗尽被直接标记为 failed，不应执行。
 	exhausted bool
+	// reason 是领取时数据库写入的失败原因，仅 exhausted 时使用。
+	reason string
 }
 
 // 调度逻辑通过该接口访问数据库，便于在单元测试中替换。
@@ -64,8 +66,10 @@ FROM unnest($1::text[], $2::text[], $3::text[], $4::text[]) AS u(id, task_type, 
 	// 领取：走 due_idx 取最早到期的任务，SKIP LOCKED 使各节点并发领取互不阻塞。
 	// 只领取本节点注册了回调的类型，滚动发布新增类型时旧节点不会领取后因缺少回调而失败。
 	// 写入新令牌和租约到期时间后语句即提交，回调在事务外执行。
-	// 预算已耗尽却因崩溃停留在 running 的任务直接转为 failed。
-	const exhausted = `t.attempts >= $3`
+	// 执行次数或重试总时长已耗尽的任务直接转为 failed；首次领取时记录预算起点。
+	// RETURNING 只为耗尽的行带出失败原因，避免普通领取回传最多 2KB 的上次错误。
+	const exhausted = `(t.attempts >= $3 OR ($6::bigint > 0 AND t.first_run_at IS NOT NULL
+    AND t.first_run_at <= now() - $6::bigint * interval '1 millisecond'))`
 	s.claimSQL = `WITH picked AS (
   SELECT id FROM ` + s.tasks + ` WHERE status < 2 AND next_run_at <= now() AND task_type = ANY($5::text[])
   ORDER BY next_run_at LIMIT $1
@@ -76,13 +80,24 @@ UPDATE ` + s.tasks + ` t SET
   attempts = CASE WHEN ` + exhausted + ` THEN t.attempts ELSE t.attempts + 1 END,
   lease_token = CASE WHEN ` + exhausted + ` THEN 0 ELSE $2::bigint END,
   next_run_at = CASE WHEN ` + exhausted + ` THEN t.next_run_at ELSE now() + $4::bigint * interval '1 millisecond' END,
-  last_error = CASE WHEN ` + exhausted + ` THEN 'retry budget exhausted after lease expiration' ELSE t.last_error END,
+  first_run_at = CASE WHEN ` + exhausted + ` THEN t.first_run_at ELSE COALESCE(t.first_run_at, now()) END,
+  last_error = CASE
+    WHEN NOT ` + exhausted + ` THEN t.last_error
+    WHEN t.attempts >= $3 THEN 'retry budget exhausted after lease expiration'
+    ELSE 'retry duration exceeded' END,
   completed_at = CASE WHEN ` + exhausted + ` THEN now() END,
   updated_at = now()
 FROM picked WHERE t.id = picked.id
-RETURNING t.id, t.task_type, t.payload, t.attempts, t.status`
+RETURNING t.id, t.task_type, t.payload, t.attempts, t.status,
+  CASE WHEN t.status <> 1 THEN t.last_error ELSE '' END`
+	// 落库重试时把 next_run_at 截断到重试期限：期限之后不会再有执行机会，
+	// 让任务在期限到达时（而不是更晚的退避时间）被领取并判定失败。
 	s.finishSQL = `UPDATE ` + s.tasks + ` SET status = $3::int2, lease_token = 0, last_error = $4, updated_at = now(),
-  next_run_at = CASE WHEN $3::int2 = 0 THEN now() + $5::bigint * interval '1 millisecond' ELSE next_run_at END,
+  next_run_at = CASE
+    WHEN $3::int2 <> 0 THEN next_run_at
+    WHEN $6::bigint <= 0 OR first_run_at IS NULL THEN now() + $5::bigint * interval '1 millisecond'
+    ELSE LEAST(now() + $5::bigint * interval '1 millisecond',
+      first_run_at + $6::bigint * interval '1 millisecond') END,
   completed_at = CASE WHEN $3::int2 >= 2 THEN now() END
 WHERE id = $1::text::uuid AND status = 1 AND lease_token = $2`
 }
@@ -103,7 +118,8 @@ func (s *pgStorage) insert(ctx context.Context, tx *sqlx.Tx, tasks []Task) error
 }
 
 func (s *pgStorage) claim(ctx context.Context, limit int, token int64, types []string) ([]claimed, error) {
-	rows, err := s.db.QueryContext(ctx, s.claimSQL, limit, token, s.config.retries+1, s.config.LeaseDuration.Milliseconds(), types)
+	rows, err := s.db.QueryContext(ctx, s.claimSQL, limit, token, s.config.retries+1,
+		s.config.LeaseDuration.Milliseconds(), types, s.config.MaxRetryDuration.Milliseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +130,7 @@ func (s *pgStorage) claim(ctx context.Context, limit int, token int64, types []s
 			c      claimed
 			status int16
 		)
-		if err := rows.Scan(&c.ID, &c.Type, &c.Payload, &c.Attempt, &status); err != nil {
+		if err := rows.Scan(&c.ID, &c.Type, &c.Payload, &c.Attempt, &status, &c.reason); err != nil {
 			return nil, err
 		}
 		c.token = token
@@ -126,7 +142,8 @@ func (s *pgStorage) claim(ctx context.Context, limit int, token int64, types []s
 
 // finish 按令牌落库执行结果；令牌不匹配说明租约已被接管，旧结果不会覆盖新状态。
 func (s *pgStorage) finish(ctx context.Context, c claimed, status Status, lastError string, delay time.Duration) error {
-	result, err := s.db.ExecContext(ctx, s.finishSQL, c.ID.String(), c.token, int16(status), lastError, delay.Milliseconds())
+	result, err := s.db.ExecContext(ctx, s.finishSQL, c.ID.String(), c.token, int16(status), lastError,
+		delay.Milliseconds(), s.config.MaxRetryDuration.Milliseconds())
 	if err != nil {
 		return err
 	}
@@ -164,9 +181,10 @@ func (s *pgStorage) get(ctx context.Context, id uuid.UUID) (Record, error) {
 	return r, nil
 }
 
+// retry 重置失败任务：清零执行次数并清空首次执行时间，使重试次数与重试总时长预算一起重新计算。
 func (s *pgStorage) retry(ctx context.Context, id uuid.UUID) error {
 	result, err := s.db.ExecContext(ctx, "UPDATE "+s.tasks+` SET status = 0, attempts = 0, lease_token = 0, last_error = '',
-  next_run_at = now(), completed_at = NULL, updated_at = now() WHERE id = $1::text::uuid AND status = 3`, id.String())
+  next_run_at = now(), first_run_at = NULL, completed_at = NULL, updated_at = now() WHERE id = $1::text::uuid AND status = 3`, id.String())
 	if err != nil {
 		return err
 	}

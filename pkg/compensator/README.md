@@ -119,6 +119,7 @@ if err := tx.Commit(); err != nil {
 | `BatchSize` | 2×WorkerCount | 单次领取上限，实际不超过空闲 worker 数 |
 | `MaxRetries` | 10 | 不含首次；`-1` 表示不重试 |
 | `RetryBackoffMin` / `RetryBackoffMax` | 1s / 5min | 指数退避，叠加 50%～100% 随机抖动 |
+| `MaxRetryDuration` | 0（不限制） | 从首次执行开始计算的重试总时长；超过后不再发起新执行，任务在期限处被判 `failed`；`Retry` 会重置该预算 |
 | `HandlerTimeout` | 30s | 回调 context 超时；回调忽略超时返回 nil 也按失败处理 |
 | `LeaseDuration` | HandlerTimeout+10s | running 任务被其它节点接管前的期限，必须大于 `HandlerTimeout`；也是执行者崩溃后任务重新可领取的等待时间 |
 | `CleanupAfter` | 5min | 成功记录保留时长 |
@@ -129,6 +130,10 @@ if err := tx.Commit(); err != nil {
 | `Logger` | `slog.Default()` | 不记录载荷 |
 
 最多执行 `1 + MaxRetries` 次。进程在领取后崩溃同样消耗一次预算，防止毒任务导致无限崩溃循环。耗尽后状态为 `failed`，可调用 `Retry(ctx, id)` 重置预算（ID 不变）。
+
+`MaxRetryDuration > 0` 时，从**首次被领取执行**开始计算重试总时长；领取前的排队和 `RunAt` 等待不计入，因此不会因为积压或未来的计划时间提前耗尽预算。失败后如果退避会越过期限，`next_run_at` 会被截断到期限，任务在期限到达时被领取并直接置为 `failed`，`last_error` 为 `retry duration exceeded`；已经在执行中的回调不会被中断，它成功则仍记为成功。`Retry(ctx, id)` 会同时重置执行次数和这个时长预算。
+
+两个预算同时生效，先到者结束任务：次数先耗尽时保持原有的 `retry budget exhausted` 行为，时长先耗尽时为 `retry duration exceeded`。
 
 ## 监控
 
@@ -149,10 +154,33 @@ type Metrics interface {
 
 后缀 `orders` 创建任务表 `compensator_orders`，主键为应用生成的 UUIDv7（登记时就有稳定 ID，时间有序利于 B-tree 追加）：
 
+- `next_run_at`：下次可领取时间；`first_run_at` 在首次领取时写入，是 `MaxRetryDuration` 的计时起点，未执行过时为 `NULL`。
 - `compensator_orders_due_idx (next_run_at) WHERE status < 2`：只包含待执行/执行中的任务，执行完成即移出，领取扫描始终很小。
 - `compensator_orders_done_idx (status, completed_at) WHERE status >= 2`：清理使用。
 
 多个节点并发启动时，建表在 `pg_advisory_xact_lock` 下串行执行，并校验列类型和索引。组件不做自动迁移，也不会覆盖已有表的存储参数。
+
+### 从旧版本升级
+
+带 `MaxRetryDuration` 的版本要求表中有 `first_run_at` 列，旧表必须在部署新版本**之前**完成迁移，否则组件启动时会因列缺失返回 `ErrInvalidConfig`。下面的语句只增加可空列、不带 `DEFAULT`，PostgreSQL 只更新系统目录、不重写表，属于在线 DDL：
+
+```sql
+BEGIN;
+SET LOCAL lock_timeout = '3s';
+ALTER TABLE "public"."compensator_orders"
+  ADD COLUMN IF NOT EXISTS first_run_at timestamptz;
+COMMIT;
+```
+
+表名规则是 `compensator_<TableSuffix>`，可用下面的查询为所有任务表生成同样的语句（按需替换 schema）：
+
+```sql
+SELECT format('ALTER TABLE %I.%I ADD COLUMN IF NOT EXISTS first_run_at timestamptz;', schemaname, tablename)
+FROM pg_tables
+WHERE schemaname = 'public' AND tablename LIKE 'compensator\_%';
+```
+
+`ADD COLUMN` 需要短暂的 `ACCESS EXCLUSIVE` 锁；`lock_timeout` 让它在拿不到锁时快速失败，失败后重试即可，避免阻塞业务。旧版本代码不读写该列，所以先执行 DDL、再滚动发布是兼容的；滚动期间旧节点不会写 `first_run_at`，这些任务会在新节点首次领取时开始计时。升级前已经存在的 pending/running 行 `first_run_at` 为 `NULL`，同样会在下一次领取时开始计时；新创建的表默认就包含该列。
 
 ## 多节点
 
@@ -213,6 +241,33 @@ FROM pg_stat_activity WHERE xact_start IS NOT NULL ORDER BY xact_start;
 ALTER TABLE compensator_orders SET (autovacuum_vacuum_threshold = 5000);
 ```
 
+### 参数评估
+
+现有参数更适合“表里只有未完成任务、稳态高频更新/删除”的场景：`fillfactor=90` 给每次领取/落库的 UPDATE 留出页面空间（这些 UPDATE 会改 `next_run_at`/`status`，无法走 HOT，但低阈值 vacuum 把膨胀限制在数千个元组内）；`due_idx`/`done_idx` 是部分索引，扫描和清理只碰相关行。稳态下不需要调整。
+
+使用 `RunAt` 调度大量远期任务后，表里可能长期存在远超“近期到期量”的行，有两个规模效应：
+
+- `due_idx` 和 `Stats` 的代价随未完成任务数增长（远期任务也计入 `pending`）；领取本身仍走索引顺序，只取到期行。
+- 绝对阈值 2000 / 10000 让 vacuum 触发频率与表大小无关。表很大而写入速率中等时，每次全表扫描的 vacuum 相对 2000 个死元组来说过于频繁；批量写入远期任务时也会反复触发 insert vacuum。
+
+如果任务表会长期保留百万级未完成任务，先把触发阈值改成“绝对 + 比例”的混合形式，再按实际观测微调：
+
+```sql
+ALTER TABLE compensator_orders SET (
+  autovacuum_vacuum_scale_factor = 0.01,
+  autovacuum_vacuum_threshold = 5000,
+  autovacuum_vacuum_insert_scale_factor = 0.01,
+  autovacuum_vacuum_insert_threshold = 50000
+);
+```
+
+- 表小：仍在约 5000 个死元组触发，保持原有及时性。
+- 表大：触发点随行数增长（如 1000 万行约 10 万死元组），避免 vacuum 持续空转。
+- `autovacuum_vacuum_cost_delay` 保持 1ms；若 vacuum 仍追不上删除速度，再提高 `autovacuum_vacuum_cost_limit`（如 1000）并观察 I/O。
+- `fillfactor` 只在 UPDATE 导致的堆膨胀明显时才降到 85；它只对新页生效，旧表需要 `pg_repack` 才有效果。
+
+如果远期任务量级远大于近期到期量（例如百万级、调度跨度数月），说明纯 PostgreSQL 轮询不是最优形态，应评估独立的延迟调度层，而不是继续调 autovacuum。
+
 ## 测试
 
 ```sh
@@ -224,6 +279,6 @@ TEST_POSTGRES_DSN='postgres://user:pass@127.0.0.1:5432/test?sslmode=disable' \
 TEST_POSTGRES_DSN='...' go test ./pkg/compensator -run '^$' -bench PostgreSQL -benchmem
 ```
 
-设置 `TEST_COMPENSATOR_LOG=1` 可输出集成测试中组件的日志。集成测试覆盖：并发建表与表参数、结构不兼容时拒绝启动、回调能看到已提交的业务数据、业务回滚、外部事务、指定执行时间（到期前不领取、过去时间立即执行）、慢回调下不因本地排队丢失租约、只领取已注册的类型、崩溃后租约接管、旧令牌无法覆盖、重试耗尽与 `Retry`、多节点并发清理、清理跳过重试中的任务、三节点并发消费与节点下线（每个任务恰好成功一次）、索引使用以及删除后空间复用。
+设置 `TEST_COMPENSATOR_LOG=1` 可输出集成测试中组件的日志。集成测试覆盖：并发建表与表参数、结构不兼容时拒绝启动、回调能看到已提交的业务数据、业务回滚、外部事务、指定执行时间（到期前不领取、过去时间立即执行）、慢回调下不因本地排队丢失租约、只领取已注册的类型、崩溃后租约接管、旧令牌无法覆盖、重试耗尽与 `Retry`、重试总时长耗尽与 `Retry` 重置、多节点并发清理、清理跳过重试中的任务、三节点并发消费与节点下线（每个任务恰好成功一次）、索引使用以及删除后空间复用。
 
 `BenchmarkPostgreSQLEndToEnd` 报告从登记到回调完成的 p50/p99 延迟、调用方 `Transaction` 耗时和吞吐，建议 `-benchtime=2000x`；`BenchmarkPostgreSQLBackground` 建议 `-benchtime=1x`。

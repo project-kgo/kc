@@ -445,6 +445,49 @@ func TestPostgreSQLIntegrationRetryExhausted(t *testing.T) {
 	}
 }
 
+// MaxRetryDuration 从首次执行开始计时：到期后不再发起新执行，任务在期限处被置为 failed；
+// 退避不会把重试排到期限之后，手动 Retry 会重置该预算。
+func TestPostgreSQLIntegrationRetryDuration(t *testing.T) {
+	db := openTestDB(t)
+	suffix := uniqueSuffix(t, db)
+	ctx := context.Background()
+	var healthy atomic.Bool
+	var attempts atomic.Int64
+	cfg := fastConfig(suffix)
+	// 次数预算很大，确保任务因时长而不是次数终止。
+	cfg.MaxRetries = 1000
+	// 退避远大于时长预算：若不截断 next_run_at，任务要等一小时后才会被判失败。
+	cfg.RetryBackoffMin = time.Hour
+	cfg.RetryBackoffMax = time.Hour
+	cfg.MaxRetryDuration = 300 * time.Millisecond
+	c := mustNew(t, db, cfg, map[string]Handler{"t": func(context.Context, *Task) error {
+		attempts.Add(1)
+		if healthy.Load() {
+			return nil
+		}
+		return errors.New("downstream unavailable")
+	}})
+	task, _ := NewTask("t", 1)
+	id := addTasks(t, c, task, 1)[0]
+	eventually(t, func() bool { return statusOf(t, c, id) == StatusFailed })
+	r, err := c.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.LastError != "retry duration exceeded" || r.Attempts != 1 {
+		t.Fatalf("duration-exhausted record: %+v", r)
+	}
+	// 手动 Retry 重置首次执行时间，预算从下一次执行重新起算。
+	healthy.Store(true)
+	if err = c.Retry(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, func() bool { return statusOf(t, c, id) == StatusSucceeded })
+	if attempts.Load() != 2 {
+		t.Fatalf("handler ran %d times, want 2", attempts.Load())
+	}
+}
+
 func TestPostgreSQLIntegrationLeaseTakeover(t *testing.T) {
 	db := openTestDB(t)
 	suffix := uniqueSuffix(t, db)

@@ -125,6 +125,10 @@ type Config struct {
 	// RetryBackoffMin / RetryBackoffMax 是指数退避的基数和上限，默认 1 秒 / 5 分钟。
 	RetryBackoffMin time.Duration
 	RetryBackoffMax time.Duration
+	// MaxRetryDuration 是首次执行开始后的重试总时长，默认 0 表示不限制。
+	// 超过该时长后不再发起新的执行：重试不会被排到期限之后，到期时任务在下一次领取中
+	// 直接置为 failed。Retry 会重置该预算。
+	MaxRetryDuration time.Duration
 	// HandlerTimeout 是回调 context 的超时，默认 30 秒。
 	HandlerTimeout time.Duration
 	// LeaseDuration 是 running 任务被其它节点接管前的期限，默认 HandlerTimeout+10 秒。
@@ -201,6 +205,12 @@ func resolveConfig(c Config) (resolvedConfig, error) {
 	}
 	if c.FailedRetention < 0 {
 		return resolvedConfig{}, fmt.Errorf("%w: negative failed retention", ErrInvalidConfig)
+	}
+	if c.MaxRetryDuration < 0 {
+		return resolvedConfig{}, fmt.Errorf("%w: negative retry duration", ErrInvalidConfig)
+	}
+	if c.MaxRetryDuration > 0 && c.MaxRetryDuration < time.Millisecond {
+		return resolvedConfig{}, fmt.Errorf("%w: retry duration must be at least 1ms", ErrInvalidConfig)
 	}
 	if c.LeaseDuration <= c.HandlerTimeout {
 		return resolvedConfig{}, fmt.Errorf("%w: lease duration must exceed handler timeout", ErrInvalidConfig)
