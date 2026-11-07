@@ -22,7 +22,7 @@ func TestResolveConfigDefaults(t *testing.T) {
 	}
 	if c.WorkerCount != 8 || c.BatchSize != 16 || c.ScanInterval != time.Second || c.retries != 10 ||
 		c.HandlerTimeout != 30*time.Second || c.LeaseDuration != 40*time.Second || c.CleanupAfter != 5*time.Minute ||
-		c.CleanupBatchSize != 1000 || c.OperationTimeout != 5*time.Second || c.MaxRetryDuration != 0 || c.Logger == nil {
+		c.CleanupBatchSize != 1000 || c.OperationTimeout != 5*time.Second || c.Logger == nil {
 		t.Fatalf("unexpected defaults: %+v", c)
 	}
 	if c, err = resolveConfig(Config{TableSuffix: "x", MaxRetries: -1}); err != nil || c.retries != 0 {
@@ -42,8 +42,6 @@ func TestResolveConfigRejectsInvalid(t *testing.T) {
 		"backoff max < min":   {TableSuffix: "x", RetryBackoffMin: time.Minute, RetryBackoffMax: time.Second},
 		"retries < -1":        {TableSuffix: "x", MaxRetries: -2},
 		"negative failed ret": {TableSuffix: "x", FailedRetention: -1},
-		"negative retry dur":  {TableSuffix: "x", MaxRetryDuration: -time.Second},
-		"tiny retry dur":      {TableSuffix: "x", MaxRetryDuration: time.Microsecond},
 	} {
 		if _, err := resolveConfig(c); !errors.Is(err, ErrInvalidConfig) {
 			t.Errorf("%s: expected ErrInvalidConfig, got %v", name, err)
@@ -472,6 +470,23 @@ func TestPrepareValidatesRunAt(t *testing.T) {
 	task, err := c.prepare(Task{Type: "t", RunAt: last})
 	if err != nil || !task.RunAt.Equal(last) {
 		t.Fatalf("valid schedule rejected or altered: %+v %v", task, err)
+	}
+}
+
+// 重试总时长按任务设置：0 表示不限制，非零时按毫秒保存，负数与亚毫秒值被拒绝。
+func TestPrepareValidatesRetryDuration(t *testing.T) {
+	c := &Compensator{}
+	c.handlers.Store(mustRegistry(map[string]Handler{"t": func(context.Context, *Task) error { return nil }}))
+	for _, d := range []time.Duration{-time.Second, time.Microsecond} {
+		if _, err := c.prepare(Task{Type: "t", MaxRetryDuration: d}); !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("duration %v: %v", d, err)
+		}
+	}
+	for _, d := range []time.Duration{0, time.Millisecond, time.Hour} {
+		task, err := c.prepare(Task{Type: "t", MaxRetryDuration: d})
+		if err != nil || task.MaxRetryDuration != d {
+			t.Fatalf("duration %v rejected or altered: %+v %v", d, task, err)
+		}
 	}
 }
 

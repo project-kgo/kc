@@ -25,8 +25,9 @@ const taskTableOptions = `fillfactor = 90,
 var taskColumns = map[string]string{
 	"id": "uuid", "task_type": "text", "payload": "text", "status": "smallint",
 	"attempts": "integer", "next_run_at": "timestamp with time zone", "first_run_at": "timestamp with time zone",
-	"lease_token": "bigint", "last_error": "text", "created_at": "timestamp with time zone",
-	"updated_at": "timestamp with time zone", "completed_at": "timestamp with time zone",
+	"max_retry_duration_ms": "bigint", "lease_token": "bigint", "last_error": "text",
+	"created_at": "timestamp with time zone", "updated_at": "timestamp with time zone",
+	"completed_at": "timestamp with time zone",
 }
 
 func quoteIdent(name string) string { return `"` + strings.ReplaceAll(name, `"`, `""`) + `"` }
@@ -62,6 +63,7 @@ func (s *pgStorage) ensureSchema(ctx context.Context) error {
   attempts integer NOT NULL,
   next_run_at timestamptz NOT NULL,
   first_run_at timestamptz,
+  max_retry_duration_ms bigint NOT NULL DEFAULT 0,
   lease_token bigint NOT NULL DEFAULT 0,
   last_error text NOT NULL DEFAULT '',
   created_at timestamptz NOT NULL,

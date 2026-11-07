@@ -67,6 +67,29 @@ err = comp.Transaction(ctx, func(tx *compensator.Tx) error {
 - 远期任务会一直保留在待执行索引（`status < 2`）中；领取仍按 `next_run_at` 顺序只取到期行，不影响领取效率，只占用少量索引空间。
 - 回调收到的 `Task` 中 `RunAt` 为零值；`Get` 返回的 `Record.NextRunAt` 才是库中的实际时间。
 
+### 指定重试总时长
+
+`Task.MaxRetryDuration` 按任务限制从首次执行开始的重试总时长，零值或不设置表示不限制。它是任务自身的属性，与组件级的 `MaxRetries` 并存，先到者结束任务：
+
+```go
+task, err := compensator.NewTask("order.remind", OrderPaid{OrderID: 42})
+if err != nil {
+    return err
+}
+task.MaxRetryDuration = 30 * time.Minute
+
+err = comp.Transaction(ctx, func(tx *compensator.Tx) error {
+    _, err := tx.Add(ctx, task)
+    return err
+})
+```
+
+- 从该任务**首次被领取执行**开始计时；排队、积压和 `RunAt` 等待不计入
+- 到期后不再发起新执行：失败后的退避不会排到期限之后，到期时任务在下一次领取中直接置为 `failed`，`last_error` 为 `retry duration exceeded`
+- 只影响该任务，不同任务的预算互不共享；正在执行中的回调不会被中断，它成功则仍记为成功
+- `Retry(ctx, id)` 会重置该任务的执行次数和计时起点，`MaxRetryDuration` 的设置本身保留
+- 时长按毫秒保存，非零值至少 1ms；负数或亚毫秒值在登记时返回 `ErrInvalidArgument`
+
 ### 单独注册回调
 
 `New` 的 `handlers` 可以为空，回调也可以在组件运行期间注册，适合各业务模块各自注册回调的场景：
@@ -119,7 +142,6 @@ if err := tx.Commit(); err != nil {
 | `BatchSize` | 2×WorkerCount | 单次领取上限，实际不超过空闲 worker 数 |
 | `MaxRetries` | 10 | 不含首次；`-1` 表示不重试 |
 | `RetryBackoffMin` / `RetryBackoffMax` | 1s / 5min | 指数退避，叠加 50%～100% 随机抖动 |
-| `MaxRetryDuration` | 0（不限制） | 从首次执行开始计算的重试总时长；超过后不再发起新执行，任务在期限处被判 `failed`；`Retry` 会重置该预算 |
 | `HandlerTimeout` | 30s | 回调 context 超时；回调忽略超时返回 nil 也按失败处理 |
 | `LeaseDuration` | HandlerTimeout+10s | running 任务被其它节点接管前的期限，必须大于 `HandlerTimeout`；也是执行者崩溃后任务重新可领取的等待时间 |
 | `CleanupAfter` | 5min | 成功记录保留时长 |
@@ -131,9 +153,7 @@ if err := tx.Commit(); err != nil {
 
 最多执行 `1 + MaxRetries` 次。进程在领取后崩溃同样消耗一次预算，防止毒任务导致无限崩溃循环。耗尽后状态为 `failed`，可调用 `Retry(ctx, id)` 重置预算（ID 不变）。
 
-`MaxRetryDuration > 0` 时，从**首次被领取执行**开始计算重试总时长；领取前的排队和 `RunAt` 等待不计入，因此不会因为积压或未来的计划时间提前耗尽预算。失败后如果退避会越过期限，`next_run_at` 会被截断到期限，任务在期限到达时被领取并直接置为 `failed`，`last_error` 为 `retry duration exceeded`；已经在执行中的回调不会被中断，它成功则仍记为成功。`Retry(ctx, id)` 会同时重置执行次数和这个时长预算。
-
-两个预算同时生效，先到者结束任务：次数先耗尽时保持原有的 `retry budget exhausted` 行为，时长先耗尽时为 `retry duration exceeded`。
+`MaxRetries` 是组件级配置；单个任务还可以用 `Task.MaxRetryDuration` 限制自己的重试总时长，见[指定重试总时长](#指定重试总时长)。
 
 ## 监控
 
@@ -154,7 +174,8 @@ type Metrics interface {
 
 后缀 `orders` 创建任务表 `compensator_orders`，主键为应用生成的 UUIDv7（登记时就有稳定 ID，时间有序利于 B-tree 追加）：
 
-- `next_run_at`：下次可领取时间；`first_run_at` 在首次领取时写入，是 `MaxRetryDuration` 的计时起点，未执行过时为 `NULL`。
+- `next_run_at`：下次可领取时间；`first_run_at` 在首次领取时写入，是该任务重试时长的计时起点，未执行过时为 `NULL`。
+- `max_retry_duration_ms`：该任务的重试总时长（毫秒），0 表示不限制；与组件配置无关。
 - `compensator_orders_due_idx (next_run_at) WHERE status < 2`：只包含待执行/执行中的任务，执行完成即移出，领取扫描始终很小。
 - `compensator_orders_done_idx (status, completed_at) WHERE status >= 2`：清理使用。
 
@@ -162,25 +183,28 @@ type Metrics interface {
 
 ### 从旧版本升级
 
-带 `MaxRetryDuration` 的版本要求表中有 `first_run_at` 列，旧表必须在部署新版本**之前**完成迁移，否则组件启动时会因列缺失返回 `ErrInvalidConfig`。下面的语句只增加可空列、不带 `DEFAULT`，PostgreSQL 只更新系统目录、不重写表，属于在线 DDL：
+带按任务重试时长的版本要求表中有 `first_run_at` 和 `max_retry_duration_ms` 两列，旧表必须在部署新版本**之前**完成迁移，否则组件启动时会因列缺失返回 `ErrInvalidConfig`。下面的语句只做元数据变更（可空列、常量默认值），PostgreSQL 不重写表，属于在线 DDL：
 
 ```sql
 BEGIN;
 SET LOCAL lock_timeout = '3s';
 ALTER TABLE "public"."compensator_orders"
-  ADD COLUMN IF NOT EXISTS first_run_at timestamptz;
+  ADD COLUMN IF NOT EXISTS first_run_at timestamptz,
+  ADD COLUMN IF NOT EXISTS max_retry_duration_ms bigint NOT NULL DEFAULT 0;
 COMMIT;
 ```
 
 表名规则是 `compensator_<TableSuffix>`，可用下面的查询为所有任务表生成同样的语句（按需替换 schema）：
 
 ```sql
-SELECT format('ALTER TABLE %I.%I ADD COLUMN IF NOT EXISTS first_run_at timestamptz;', schemaname, tablename)
+SELECT format(
+  'ALTER TABLE %I.%I ADD COLUMN IF NOT EXISTS first_run_at timestamptz, ADD COLUMN IF NOT EXISTS max_retry_duration_ms bigint NOT NULL DEFAULT 0;',
+  schemaname, tablename)
 FROM pg_tables
 WHERE schemaname = 'public' AND tablename LIKE 'compensator\_%';
 ```
 
-`ADD COLUMN` 需要短暂的 `ACCESS EXCLUSIVE` 锁；`lock_timeout` 让它在拿不到锁时快速失败，失败后重试即可，避免阻塞业务。旧版本代码不读写该列，所以先执行 DDL、再滚动发布是兼容的；滚动期间旧节点不会写 `first_run_at`，这些任务会在新节点首次领取时开始计时。升级前已经存在的 pending/running 行 `first_run_at` 为 `NULL`，同样会在下一次领取时开始计时；新创建的表默认就包含该列。
+`ALTER TABLE` 需要短暂的 `ACCESS EXCLUSIVE` 锁；`lock_timeout` 让它在拿不到锁时快速失败，失败后重试即可，避免阻塞业务。旧版本代码不读写这两列，所以先执行 DDL、再滚动发布是兼容的；滚动期间旧节点不会写 `first_run_at`，这些任务会在新节点首次领取时开始计时，旧节点登记的任务 `max_retry_duration_ms` 取默认值 0（不限制）。升级前已经存在的 pending/running 行 `first_run_at` 为 `NULL`，同样会在下一次领取时开始计时；新创建的表默认就包含这两列。
 
 ## 多节点
 
@@ -279,6 +303,6 @@ TEST_POSTGRES_DSN='postgres://user:pass@127.0.0.1:5432/test?sslmode=disable' \
 TEST_POSTGRES_DSN='...' go test ./pkg/compensator -run '^$' -bench PostgreSQL -benchmem
 ```
 
-设置 `TEST_COMPENSATOR_LOG=1` 可输出集成测试中组件的日志。集成测试覆盖：并发建表与表参数、结构不兼容时拒绝启动、回调能看到已提交的业务数据、业务回滚、外部事务、指定执行时间（到期前不领取、过去时间立即执行）、慢回调下不因本地排队丢失租约、只领取已注册的类型、崩溃后租约接管、旧令牌无法覆盖、重试耗尽与 `Retry`、重试总时长耗尽与 `Retry` 重置、多节点并发清理、清理跳过重试中的任务、三节点并发消费与节点下线（每个任务恰好成功一次）、索引使用以及删除后空间复用。
+设置 `TEST_COMPENSATOR_LOG=1` 可输出集成测试中组件的日志。集成测试覆盖：并发建表与表参数、结构不兼容时拒绝启动、回调能看到已提交的业务数据、业务回滚、外部事务、指定执行时间（到期前不领取、过去时间立即执行）、慢回调下不因本地排队丢失租约、只领取已注册的类型、崩溃后租约接管、旧令牌无法覆盖、重试耗尽与 `Retry`、按任务设置的重试总时长（互不影响）与 `Retry` 重置、多节点并发清理、清理跳过重试中的任务、三节点并发消费与节点下线（每个任务恰好成功一次）、索引使用以及删除后空间复用。
 
 `BenchmarkPostgreSQLEndToEnd` 报告从登记到回调完成的 p50/p99 延迟、调用方 `Transaction` 耗时和吞吐，建议 `-benchtime=2000x`；`BenchmarkPostgreSQLBackground` 建议 `-benchtime=1x`。

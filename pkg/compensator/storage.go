@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -59,17 +60,17 @@ func newPGStorage(db *sqlx.DB, c resolvedConfig) (*pgStorage, error) {
 func (s *pgStorage) setNames(schema string) {
 	s.tasks = quoteIdent(schema) + "." + quoteIdent(s.taskName)
 	// 以 text[] 传参再在 SQL 中转换，避免依赖驱动对 uuid 数组的二进制编码。
-	s.insertSQL = `INSERT INTO ` + s.tasks + ` (id, task_type, payload, status, attempts, next_run_at, created_at, updated_at)
+	s.insertSQL = `INSERT INTO ` + s.tasks + ` (id, task_type, payload, status, attempts, next_run_at, max_retry_duration_ms, created_at, updated_at)
 SELECT u.id::uuid, u.task_type, u.payload, 0, 0,
-  CASE WHEN u.run_at = '' THEN now() ELSE u.run_at::timestamptz END, now(), now()
-FROM unnest($1::text[], $2::text[], $3::text[], $4::text[]) AS u(id, task_type, payload, run_at)`
+  CASE WHEN u.run_at = '' THEN now() ELSE u.run_at::timestamptz END, u.retry_ms::bigint, now(), now()
+FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[]) AS u(id, task_type, payload, run_at, retry_ms)`
 	// 领取：走 due_idx 取最早到期的任务，SKIP LOCKED 使各节点并发领取互不阻塞。
 	// 只领取本节点注册了回调的类型，滚动发布新增类型时旧节点不会领取后因缺少回调而失败。
 	// 写入新令牌和租约到期时间后语句即提交，回调在事务外执行。
-	// 执行次数或重试总时长已耗尽的任务直接转为 failed；首次领取时记录预算起点。
+	// 执行次数或该任务的重试总时长已耗尽的任务直接转为 failed；首次领取时记录预算起点。
 	// RETURNING 只为耗尽的行带出失败原因，避免普通领取回传最多 2KB 的上次错误。
-	const exhausted = `(t.attempts >= $3 OR ($6::bigint > 0 AND t.first_run_at IS NOT NULL
-    AND t.first_run_at <= now() - $6::bigint * interval '1 millisecond'))`
+	const exhausted = `(t.attempts >= $3 OR (t.max_retry_duration_ms > 0 AND t.first_run_at IS NOT NULL
+    AND t.first_run_at <= now() - t.max_retry_duration_ms * interval '1 millisecond'))`
 	s.claimSQL = `WITH picked AS (
   SELECT id FROM ` + s.tasks + ` WHERE status < 2 AND next_run_at <= now() AND task_type = ANY($5::text[])
   ORDER BY next_run_at LIMIT $1
@@ -95,31 +96,33 @@ RETURNING t.id, t.task_type, t.payload, t.attempts, t.status,
 	s.finishSQL = `UPDATE ` + s.tasks + ` SET status = $3::int2, lease_token = 0, last_error = $4, updated_at = now(),
   next_run_at = CASE
     WHEN $3::int2 <> 0 THEN next_run_at
-    WHEN $6::bigint <= 0 OR first_run_at IS NULL THEN now() + $5::bigint * interval '1 millisecond'
+    WHEN max_retry_duration_ms <= 0 OR first_run_at IS NULL THEN now() + $5::bigint * interval '1 millisecond'
     ELSE LEAST(now() + $5::bigint * interval '1 millisecond',
-      first_run_at + $6::bigint * interval '1 millisecond') END,
+      first_run_at + max_retry_duration_ms * interval '1 millisecond') END,
   completed_at = CASE WHEN $3::int2 >= 2 THEN now() END
 WHERE id = $1::text::uuid AND status = 1 AND lease_token = $2`
 }
 
 // insert 在业务事务内写入待执行任务。RunAt 为零时以数据库时钟取 now()，
 // 表示提交后立即可领取；否则写入指定时间，到期前领取语句不会选中该行。
+// MaxRetryDuration 按毫秒保存，0 表示不限制。
 func (s *pgStorage) insert(ctx context.Context, tx *sqlx.Tx, tasks []Task) error {
-	ids, types, payloads, runAts := make([]string, len(tasks)), make([]string, len(tasks)), make([]string, len(tasks)), make([]string, len(tasks))
+	ids, types, payloads, runAts, retryDurations := make([]string, len(tasks)), make([]string, len(tasks)), make([]string, len(tasks)), make([]string, len(tasks)), make([]string, len(tasks))
 	for i, t := range tasks {
 		ids[i], types[i], payloads[i] = t.ID.String(), t.Type, t.Payload
+		retryDurations[i] = strconv.FormatInt(t.MaxRetryDuration.Milliseconds(), 10)
 		if !t.RunAt.IsZero() {
 			// 统一转成 UTC 的 RFC3339Nano 文本，由 SQL 转换为 timestamptz。
 			runAts[i] = t.RunAt.UTC().Format(time.RFC3339Nano)
 		}
 	}
-	_, err := tx.ExecContext(ctx, s.insertSQL, ids, types, payloads, runAts)
+	_, err := tx.ExecContext(ctx, s.insertSQL, ids, types, payloads, runAts, retryDurations)
 	return err
 }
 
 func (s *pgStorage) claim(ctx context.Context, limit int, token int64, types []string) ([]claimed, error) {
 	rows, err := s.db.QueryContext(ctx, s.claimSQL, limit, token, s.config.retries+1,
-		s.config.LeaseDuration.Milliseconds(), types, s.config.MaxRetryDuration.Milliseconds())
+		s.config.LeaseDuration.Milliseconds(), types)
 	if err != nil {
 		return nil, err
 	}
@@ -143,7 +146,7 @@ func (s *pgStorage) claim(ctx context.Context, limit int, token int64, types []s
 // finish 按令牌落库执行结果；令牌不匹配说明租约已被接管，旧结果不会覆盖新状态。
 func (s *pgStorage) finish(ctx context.Context, c claimed, status Status, lastError string, delay time.Duration) error {
 	result, err := s.db.ExecContext(ctx, s.finishSQL, c.ID.String(), c.token, int16(status), lastError,
-		delay.Milliseconds(), s.config.MaxRetryDuration.Milliseconds())
+		delay.Milliseconds())
 	if err != nil {
 		return err
 	}
@@ -166,11 +169,12 @@ func (s *pgStorage) get(ctx context.Context, id uuid.UUID) (Record, error) {
 	var (
 		r         Record
 		status    int16
+		retryMS   int64
 		completed sql.NullTime
 	)
-	err := s.db.QueryRowContext(ctx, `SELECT id, task_type, payload, status, attempts, next_run_at,
+	err := s.db.QueryRowContext(ctx, `SELECT id, task_type, payload, status, attempts, max_retry_duration_ms, next_run_at,
   last_error, created_at, updated_at, completed_at FROM `+s.tasks+` WHERE id = $1::text::uuid`, id.String()).
-		Scan(&r.ID, &r.Type, &r.Payload, &status, &r.Attempts, &r.NextRunAt, &r.LastError, &r.CreatedAt, &r.UpdatedAt, &completed)
+		Scan(&r.ID, &r.Type, &r.Payload, &status, &r.Attempts, &retryMS, &r.NextRunAt, &r.LastError, &r.CreatedAt, &r.UpdatedAt, &completed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Record{}, ErrNotFound
 	}
@@ -178,6 +182,7 @@ func (s *pgStorage) get(ctx context.Context, id uuid.UUID) (Record, error) {
 		return Record{}, err
 	}
 	r.Attempt, r.Status, r.CompletedAt = r.Attempts, Status(status), completed.Time
+	r.MaxRetryDuration = time.Duration(retryMS) * time.Millisecond
 	return r, nil
 }
 

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
@@ -193,6 +194,10 @@ func (c *Compensator) prepare(task Task) (Task, error) {
 	if task.Attempt != 0 {
 		return Task{}, fmt.Errorf("%w: new task must not set attempt", ErrInvalidArgument)
 	}
+	// 库中按毫秒保存；允许 0（不限制），但拒绝负数和非零的亚毫秒值，避免被截断后语义变化。
+	if task.MaxRetryDuration < 0 || (task.MaxRetryDuration > 0 && task.MaxRetryDuration < time.Millisecond) {
+		return Task{}, fmt.Errorf("%w: max retry duration must be 0 or at least 1ms", ErrInvalidArgument)
+	}
 	// timestamptz 能表示更宽的范围，但 RFC3339 只覆盖公元 1..9999 年；
 	// 按 UTC 判断并在这里拒绝，避免非法时间拖到 INSERT 时才以数据库错误让整个业务事务回滚。
 	if runAt := task.RunAt.UTC(); !task.RunAt.IsZero() && (runAt.Year() < 1 || runAt.Year() > 9999) {
@@ -223,7 +228,7 @@ type Tx struct {
 func (t *Tx) SQLTx() *sqlx.Tx { return t.tx }
 
 // Add 登记任务并返回任务 ID，任务在业务回调返回后随事务一起写入。
-// 设置 Task.RunAt 可指定首次执行时间，零值表示提交后立即可执行。
+// 设置 Task.RunAt 可指定首次执行时间，Task.MaxRetryDuration 可限制该任务的重试总时长。
 // 返回错误时整个事务不会提交，即使业务忽略了该错误。
 func (t *Tx) Add(ctx context.Context, task Task) (uuid.UUID, error) {
 	t.mu.Lock()
@@ -310,7 +315,7 @@ func (c *Compensator) Transaction(ctx context.Context, fn func(tx *Tx) error) er
 }
 
 // AddTx 把任务写入调用方已有的事务并返回任务 ID。提交后任务由任一节点在 ScanInterval
-// 内领取执行；设置 Task.RunAt 可指定首次执行时间，零值表示提交后立即可执行。
+// 内领取执行；设置 Task.RunAt 可指定首次执行时间，Task.MaxRetryDuration 可限制重试总时长。
 // tx 必须属于创建组件时使用的同一数据库。
 func (c *Compensator) AddTx(ctx context.Context, tx *sqlx.Tx, task Task) (uuid.UUID, error) {
 	done, err := c.begin(ctx)

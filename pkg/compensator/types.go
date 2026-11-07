@@ -66,6 +66,10 @@ type Task struct {
 	// 失败重试仍按退避策略重新排期。到期由数据库时钟判断，调用方时钟偏差会直接影响触发时刻。
 	// 回调收到的 Task 中该字段为零值；Get 返回的 Record.NextRunAt 才是库中的实际时间。
 	RunAt time.Time
+	// MaxRetryDuration 是该任务从首次执行开始的最大重试总时长，零值表示不限制。
+	// 到期后不再发起新的执行：重试不会被排到期限之后，到期时任务在下一次领取中直接置为 failed。
+	// 只影响该任务，Get 返回的记录中为库中保存的值，Retry 会重置计时。回调收到的 Task 中为零值。
+	MaxRetryDuration time.Duration
 }
 
 // NewTask 使用 sonic 将 value 编码为 Payload 字符串。
@@ -125,10 +129,6 @@ type Config struct {
 	// RetryBackoffMin / RetryBackoffMax 是指数退避的基数和上限，默认 1 秒 / 5 分钟。
 	RetryBackoffMin time.Duration
 	RetryBackoffMax time.Duration
-	// MaxRetryDuration 是首次执行开始后的重试总时长，默认 0 表示不限制。
-	// 超过该时长后不再发起新的执行：重试不会被排到期限之后，到期时任务在下一次领取中
-	// 直接置为 failed。Retry 会重置该预算。
-	MaxRetryDuration time.Duration
 	// HandlerTimeout 是回调 context 的超时，默认 30 秒。
 	HandlerTimeout time.Duration
 	// LeaseDuration 是 running 任务被其它节点接管前的期限，默认 HandlerTimeout+10 秒。
@@ -205,12 +205,6 @@ func resolveConfig(c Config) (resolvedConfig, error) {
 	}
 	if c.FailedRetention < 0 {
 		return resolvedConfig{}, fmt.Errorf("%w: negative failed retention", ErrInvalidConfig)
-	}
-	if c.MaxRetryDuration < 0 {
-		return resolvedConfig{}, fmt.Errorf("%w: negative retry duration", ErrInvalidConfig)
-	}
-	if c.MaxRetryDuration > 0 && c.MaxRetryDuration < time.Millisecond {
-		return resolvedConfig{}, fmt.Errorf("%w: retry duration must be at least 1ms", ErrInvalidConfig)
 	}
 	if c.LeaseDuration <= c.HandlerTimeout {
 		return resolvedConfig{}, fmt.Errorf("%w: lease duration must exceed handler timeout", ErrInvalidConfig)
